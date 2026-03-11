@@ -66,6 +66,7 @@
 #include "io.c"
 #include "jump_label.c"
 #include "kunit.c"
+#include "lsm.c"
 #include "list.c"
 #include "maple_tree.c"
 #include "mm.c"
