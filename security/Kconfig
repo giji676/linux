@@ -303,6 +303,7 @@ config SECURITY_COMMONCAP_KUNIT_TEST
 	  to the KUnit documentation in Documentation/dev-tools/kunit/.
 
 	  If unsure, say N.
+source "security/rust_lsm/Kconfig"
 
 source "security/Kconfig.hardening"
 
