@@ -1,0 +1,1010 @@
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH v2 1/5] rust: bindings: include lsm_hooks.h to expose LSM
+ types to bindgen
+From: Jamie Lindsey <jamie@matrixforgelabs.com>
+Date: Wed, 11 Mar 2026 05:09:02 +0000
+Message-Id: <0102019cdb4c6516-ec8251f5-7b55-45aa-9d57-9b86c70c3c02-000000@eu-west-1.amazonses.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add lsm_hooks.h to bindings_helper.h so that bindgen generates Rust
+bindings for lsm_id, lsm_info, security_hook_list, and LSM_ID_*
+constants.  These are required by the Rust LSM abstraction layer
+introduced in subsequent patches.
+
+Placed alphabetically between jump_label.h and mdio.h.
+
+Assisted-by: Claude:claude-sonnet-4-6
+Signed-off-by: Jamie Lindsey <jamie@matrixforgelabs.com>
+---
+ rust/bindings/bindings_helper.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 083cc44aa952..b819592868e3 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -63,6 +63,7 @@
+ #include <linux/ioport.h>
+ #include <linux/jiffies.h>
+ #include <linux/jump_label.h>
++#include <linux/lsm_hooks.h>
+ #include <linux/mdio.h>
+ #include <linux/mm.h>
+ #include <linux/miscdevice.h>
+-- 
+2.53.0
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH v2 2/5] rust: helpers: add C shims for LSM hook
+ initialisation
+From: Jamie Lindsey <jamie@matrixforgelabs.com>
+Date: Wed, 11 Mar 2026 05:09:04 +0000
+Message-Id: <0102019cdb4c6a42-a28bbebb-3664-4792-966f-4036c94ac19c-000000@eu-west-1.amazonses.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+struct security_hook_list carries __randomize_layout, making its fields
+inaccessible to Rust code (bindgen sees the natural field order, which
+may differ when CONFIG_RANDSTRUCT is active).  Add thin C wrapper
+functions that call LSM_HOOK_INIT() — the existing C macro that handles
+the randomised layout correctly — so that Rust can populate hook slots
+without touching struct fields directly.
+
+Three hook shims are provided (file_open, task_alloc, task_free) plus a
+wrapper for security_add_hooks() which is __init and must carry that
+annotation to ensure correct placement in the init text section.
+
+Hook signatures verified against union security_list_options generated
+from lsm_hook_defs.h: all three match exactly, including u64 for
+task_alloc's clone_flags parameter (not unsigned long).
+
+Assisted-by: Claude:claude-sonnet-4-6
+Signed-off-by: Jamie Lindsey <jamie@matrixforgelabs.com>
+---
+ rust/helpers/helpers.c |  1 +
+ rust/helpers/lsm.c     | 49 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+ create mode 100644 rust/helpers/lsm.c
+
+diff --git a/rust/helpers/helpers.c b/rust/helpers/helpers.c
+index a3c42e51f00a..c496917be073 100644
+--- a/rust/helpers/helpers.c
++++ b/rust/helpers/helpers.c
+@@ -35,6 +35,7 @@
+ #include "io.c"
+ #include "jump_label.c"
+ #include "kunit.c"
++#include "lsm.c"
+ #include "maple_tree.c"
+ #include "mm.c"
+ #include "mutex.c"
+diff --git a/rust/helpers/lsm.c b/rust/helpers/lsm.c
+new file mode 100644
+index 000000000000..fb475428fd0d
+--- /dev/null
++++ b/rust/helpers/lsm.c
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/lsm_hooks.h>
++
++/*
++ * Hook list initializers.
++ *
++ * struct security_hook_list carries __randomize_layout, so its fields must
++ * never be set by Rust code directly (bindgen sees only the "natural" field
++ * order, which may differ when CONFIG_RANDSTRUCT is enabled).  These helpers
++ * wrap LSM_HOOK_INIT(), the C macro the kernel already uses for this purpose,
++ * so that Rust can safely obtain an initialised security_hook_list without
++ * ever touching the struct's fields directly.
++ */
++
++__rust_helper void
++rust_helper_lsm_hook_init_file_open(struct security_hook_list *hl,
++				    int (*fn)(struct file *))
++{
++	*hl = (struct security_hook_list)LSM_HOOK_INIT(file_open, fn);
++}
++
++__rust_helper void
++rust_helper_lsm_hook_init_task_alloc(struct security_hook_list *hl,
++				     int (*fn)(struct task_struct *, u64))
++{
++	*hl = (struct security_hook_list)LSM_HOOK_INIT(task_alloc, fn);
++}
++
++__rust_helper void
++rust_helper_lsm_hook_init_task_free(struct security_hook_list *hl,
++				    void (*fn)(struct task_struct *))
++{
++	*hl = (struct security_hook_list)LSM_HOOK_INIT(task_free, fn);
++}
++
++/*
++ * security_add_hooks() is __init — it installs callbacks into the static-call
++ * table and must only be called during kernel initialisation.  This wrapper
++ * keeps the __init annotation so the linker places it alongside the rest of
++ * the init text, and Rust callers invoke it only from their own __init path
++ * (the lsm_info.init callback).
++ */
++void __init
++rust_helper_security_add_hooks(struct security_hook_list *hooks, int count,
++			       const struct lsm_id *lsmid)
++{
++	security_add_hooks(hooks, count, lsmid);
++}
+-- 
+2.53.0
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH v2 3/5] rust: kernel: add LSM abstraction layer
+From: Jamie Lindsey <jamie@matrixforgelabs.com>
+Date: Wed, 11 Mar 2026 05:09:05 +0000
+Message-Id: <0102019cdb4c705e-7d46b4f3-5cbb-4a6a-b315-e10f182fa987-000000@eu-west-1.amazonses.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Introduce kernel::lsm, a safe Rust interface for writing Linux Security
+Modules:
+
+- Hooks trait: one method per LSM hook, all defaulting to no-op allow.
+  Sync + Send + 'static bounds are required because hooks may be called
+  concurrently from any CPU.
+
+- Adapter<T>: zero-cost monomorphised bridge converting unsafe extern "C"
+  callbacks (required by the hook ABI) to safe Rust.  No vtable; each
+  hook is a standalone function pointer.
+
+- LsmId / LsmInfo: #[repr(transparent)] wrappers with unsafe impl Sync
+  around lsm_id and lsm_info.  Both types contain *const c_char pointers
+  to 'static string literals which are never mutated, making the Sync
+  impl sound.
+
+- define_lsm! macro: generates the static __LSM_ID, the MaybeUninit hook
+  array __LSM_HOOKS, the __lsm_init() init function that fills hook slots
+  via the C shims and calls security_add_hooks(), and the __LSM_INFO
+  descriptor placed in .lsm_info.init so that security_init() discovers
+  and calls the init function at boot.
+
+The static mut __LSM_HOOKS array is intentionally mutable: it is written
+exactly once by __lsm_init() in the single-threaded boot context before
+security_add_hooks() copies the entries into the static-call table.  No
+access occurs after that point.  UnsafeCell or a lock would add overhead
+with no safety benefit in this init-only path.
+
+Gated on CONFIG_SECURITY via #[cfg(CONFIG_SECURITY)] in lib.rs.
+
+This is v1.  Planned follow-ups: SecurityBlob<T> for per-inode/per-task
+state, proc-macro support for multiple concurrent Rust LSMs, and
+additional hook wrappers as safe Rust types for their arguments land
+upstream.
+
+Assisted-by: Claude:claude-sonnet-4-6
+Signed-off-by: Jamie Lindsey <jamie@matrixforgelabs.com>
+---
+ rust/kernel/lib.rs |   2 +
+ rust/kernel/lsm.rs | 295 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 297 insertions(+)
+ create mode 100644 rust/kernel/lsm.rs
+
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 3da92f18f4ee..af3e2416a581 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -112,6 +112,8 @@
+ #[cfg(CONFIG_KUNIT)]
+ pub mod kunit;
+ pub mod list;
++#[cfg(CONFIG_SECURITY)]
++pub mod lsm;
+ pub mod maple_tree;
+ pub mod miscdevice;
+ pub mod mm;
+diff --git a/rust/kernel/lsm.rs b/rust/kernel/lsm.rs
+new file mode 100644
+index 000000000000..bdd3ba4f72ba
+--- /dev/null
++++ b/rust/kernel/lsm.rs
+@@ -0,0 +1,295 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Linux Security Module (LSM) abstractions.
++//!
++//! This module provides safe Rust abstractions for implementing Linux Security
++//! Modules.  An LSM written in Rust implements the [`Hooks`] trait, then
++//! registers itself at boot time with the [`define_lsm!`] macro.
++//!
++//! # Minimal example
++//!
++//! ```no_run
++//! use kernel::lsm;
++//! use kernel::prelude::*;
++//!
++//! struct MyLsm;
++//!
++//! impl lsm::Hooks for MyLsm {
++//!     fn file_open(file: &kernel::fs::File) -> Result {
++//!         pr_info!("file_open: flags={:#x}\n", file.flags());
++//!         Ok(())
++//!     }
++//! }
++//!
++//! kernel::define_lsm!(MyLsm, "my_lsm\0", bindings::LSM_ID_UNDEF as u64);
++//! ```
++//!
++//! C headers: [`include/linux/lsm_hooks.h`](srctree/include/linux/lsm_hooks.h),
++//!            [`include/linux/security.h`](srctree/include/linux/security.h)
++
++use crate::{bindings, fs::File, task::Task};
++use core::marker::PhantomData;
++use core::mem::MaybeUninit;
++
++/// Wrapper around [`bindings::lsm_id`] that implements [`Sync`].
++///
++/// `lsm_id` contains a `*const c_char` name pointer (not `Sync` by default).
++/// The pointer always points to a string literal in static storage and is
++/// never mutated after construction, so sharing across threads is safe.
++#[repr(transparent)]
++pub struct LsmId(pub bindings::lsm_id);
++
++// SAFETY: `lsm_id` holds only a static string pointer and a numeric ID.
++// Both are immutable after construction.
++unsafe impl Sync for LsmId {}
++
++/// Wrapper around [`bindings::lsm_info`] that implements [`Sync`].
++///
++/// `lsm_info` contains several raw pointer fields.  All are set to static
++/// addresses during `define_lsm!` macro expansion and are never mutated
++/// after that, so sharing across threads is safe.
++#[repr(transparent)]
++pub struct LsmInfo(pub bindings::lsm_info);
++
++// SAFETY: `lsm_info` is initialised once (at compile time via const fn)
++// with pointers to static data, then placed in `.lsm_info.init` as a
++// read-only descriptor.
++unsafe impl Sync for LsmInfo {}
++
++/// The trait that a Rust LSM must implement.
++///
++/// Each method corresponds to a kernel LSM hook.  Methods have default
++/// no-op implementations so you only need to override the hooks you care
++/// about.
++///
++/// # Safety contract for implementors
++///
++/// All methods are called from kernel context and may be called concurrently.
++/// Implementors must ensure their implementations are:
++///
++/// - **Thread-safe** — multiple CPUs may call the same hook simultaneously.
++/// - **Non-sleeping where required** — [`Hooks::task_free`] runs in a context
++///   that must not sleep; see its documentation.
++///
++/// The `Sync + Send + 'static` bounds enforce these requirements at the
++/// type level.
++pub trait Hooks: Sync + Send + 'static {
++    /// Called when a file is being opened.
++    ///
++    /// Return `Ok(())` to allow the open, or an `Err` to deny it.
++    /// Common denial codes: [`EACCES`](crate::error::code::EACCES),
++    /// [`EPERM`](crate::error::code::EPERM).
++    fn file_open(_file: &File) -> crate::error::Result {
++        Ok(())
++    }
++
++    /// Called when a new task (thread or process) is being created.
++    ///
++    /// `clone_flags` contains the `CLONE_*` flags passed to `clone(2)`.
++    ///
++    /// Return `Ok(())` to allow creation, or an `Err` to deny it.
++    fn task_alloc(_task: &Task, _clone_flags: u64) -> crate::error::Result {
++        Ok(())
++    }
++
++    /// Called when a task is being freed.
++    ///
++    /// This hook runs during task teardown.  **Must not sleep.**  Any
++    /// per-task state stored in a security blob should be cleaned up here.
++    fn task_free(_task: &Task) {}
++}
++
++/// C-callable adapter functions that bridge the LSM framework to [`Hooks`].
++///
++/// This type is never instantiated.  Its associated functions serve as the
++/// `unsafe extern "C" fn` pointers registered with the kernel's LSM
++/// static-call infrastructure.
++///
++/// # Invariants
++///
++/// Each adapter function is called only from the LSM framework in the
++/// appropriate hook context, with valid, non-null pointer arguments.
++#[doc(hidden)]
++pub struct Adapter<T: Hooks>(PhantomData<T>);
++
++impl<T: Hooks> Adapter<T> {
++    /// Adapter for the `file_open` LSM hook.
++    ///
++    /// # Safety
++    ///
++    /// `file` must be a valid, non-null pointer to a `struct file` that
++    /// remains valid for the duration of this call.  Called only by the
++    /// LSM framework.
++    pub unsafe extern "C" fn file_open(
++        file: *mut bindings::file,
++    ) -> core::ffi::c_int {
++        // SAFETY: The LSM framework guarantees `file` is valid and non-null
++        // for the duration of this call.
++        let file_ref = unsafe { File::from_raw_file(file.cast_const()) };
++        match T::file_open(file_ref) {
++            Ok(()) => 0,
++            Err(e) => e.to_errno(),
++        }
++    }
++
++    /// Adapter for the `task_alloc` LSM hook.
++    ///
++    /// # Safety
++    ///
++    /// `task` must be a valid, non-null pointer to a newly-allocated
++    /// `task_struct`.  `clone_flags` are the flags passed to `clone(2)`.
++    /// Called only by the LSM framework.
++    pub unsafe extern "C" fn task_alloc(
++        task: *mut bindings::task_struct,
++        clone_flags: u64,
++    ) -> core::ffi::c_int {
++        // SAFETY: The LSM framework guarantees `task` is valid, non-null,
++        // and exclusively owned by the framework for the duration of this
++        // call.  `Task` is `#[repr(transparent)]` over
++        // `Opaque<task_struct>`, which is `#[repr(transparent)]` over
++        // `UnsafeCell<MaybeUninit<task_struct>>`, giving the same layout.
++        let task_ref = unsafe { &*(task as *const Task) };
++        match T::task_alloc(task_ref, clone_flags) {
++            Ok(()) => 0,
++            Err(e) => e.to_errno(),
++        }
++    }
++
++    /// Adapter for the `task_free` LSM hook.
++    ///
++    /// # Safety
++    ///
++    /// `task` must be a valid, non-null pointer to a `task_struct` that
++    /// is being freed.  Must not sleep.  Called only by the LSM framework.
++    pub unsafe extern "C" fn task_free(task: *mut bindings::task_struct) {
++        // SAFETY: Same layout argument as `task_alloc`.
++        let task_ref = unsafe { &*(task as *const Task) };
++        T::task_free(task_ref);
++    }
++}
++
++/// Constructs a [`bindings::lsm_info`] value for use by [`define_lsm!`].
++///
++/// All fields not explicitly set are zero-initialised, which the kernel
++/// interprets as:
++/// - `order`: `LSM_ORDER_MUTABLE` (0)
++/// - `flags`: none
++/// - `blobs`: no security blobs requested
++/// - `enabled`: use the default (always enabled)
++/// - `initcall_*`: no additional initcalls
++///
++/// # Safety
++///
++/// - `id` must point to a `lsm_id` with `'static` lifetime.
++/// - `init` must be a valid init function called once during `security_init()`.
++#[doc(hidden)]
++pub const unsafe fn new_lsm_info(
++    id: *const bindings::lsm_id,
++    init: Option<unsafe extern "C" fn() -> core::ffi::c_int>,
++) -> LsmInfo {
++    // SAFETY: `bindings::lsm_info` is a C struct.  Zero-initialisation
++    // gives valid zero/null values for every optional field.  The caller
++    // is responsible for providing a valid `id` and `init`.
++    let mut info: bindings::lsm_info =
++        unsafe { MaybeUninit::zeroed().assume_init() };
++    info.id = id;
++    info.init = init;
++    LsmInfo(info)
++}
++
++/// Registers a Rust LSM implementation with the kernel at boot time.
++///
++/// # Usage
++///
++/// ```no_run
++/// kernel::define_lsm!(MyLsmType, "my_lsm\0", bindings::LSM_ID_UNDEF as u64);
++/// ```
++///
++/// The macro generates:
++/// - A `static lsm_id` identifying this LSM to the kernel.
++/// - A static array of `security_hook_list` entries (initialised via C shims
++///   to avoid `__randomize_layout` pitfalls).
++/// - An `unsafe extern "C"` init function that populates the hook list and
++///   calls `security_add_hooks()`.
++/// - A `static lsm_info` placed in the `.lsm_info.init` linker section so
++///   the kernel discovers and calls the init function during `security_init()`.
++///
++/// # Limitations (v1)
++///
++/// - Only the `file_open`, `task_alloc`, and `task_free` hooks are registered.
++///   Additional hooks will be added in follow-up patches as safe Rust wrappers
++///   for the argument types are contributed upstream.
++/// - At most one Rust LSM can be registered per kernel build.  Unique name
++///   generation for multiple LSMs requires a proc-macro (planned for v2).
++#[macro_export]
++macro_rules! define_lsm {
++    ($T:ty, $name:expr, $id:expr) => {
++        mod __rust_lsm_registration {
++            use super::*;
++
++            // The LSM identity — must be 'static because the static-call
++            // table holds a back-pointer to it via security_hook_list.lsmid.
++            // LsmId wraps lsm_id with `unsafe impl Sync` so it can be `static`.
++            static __LSM_ID: $crate::lsm::LsmId =
++                $crate::lsm::LsmId($crate::bindings::lsm_id {
++                    name: $name.as_ptr().cast(),
++                    id: $id,
++                });
++
++            // The hook list array.  MaybeUninit avoids needing security_hook_list
++            // to implement a const-initialiser; the C shims fill each slot in
++            // __lsm_init() below before any hook can fire.
++            //
++            // SAFETY: This array must be 'static — the static-call table holds
++            // back-pointers (scall->hl) into it after registration.
++            static mut __LSM_HOOKS: [
++                ::core::mem::MaybeUninit<$crate::bindings::security_hook_list>;
++                3
++            ] = [::core::mem::MaybeUninit::zeroed(); 3];
++
++            // The init function stored in lsm_info.init.  Called once by
++            // security_init() in single-threaded boot context.
++            unsafe extern "C" fn __lsm_init() -> ::core::ffi::c_int {
++                // SAFETY: Called once, single-threaded, during security_init().
++                // __LSM_HOOKS is exclusively owned here.
++                unsafe {
++                    // bindgen strips the rust_helper_ prefix from helper names.
++                    $crate::bindings::lsm_hook_init_file_open(
++                        __LSM_HOOKS[0].as_mut_ptr(),
++                        Some($crate::lsm::Adapter::<$T>::file_open),
++                    );
++                    $crate::bindings::lsm_hook_init_task_alloc(
++                        __LSM_HOOKS[1].as_mut_ptr(),
++                        Some($crate::lsm::Adapter::<$T>::task_alloc),
++                    );
++                    $crate::bindings::lsm_hook_init_task_free(
++                        __LSM_HOOKS[2].as_mut_ptr(),
++                        Some($crate::lsm::Adapter::<$T>::task_free),
++                    );
++                    $crate::bindings::security_add_hooks(
++                        __LSM_HOOKS[0].as_mut_ptr(),
++                        __LSM_HOOKS.len() as ::core::ffi::c_int,
++                        &raw const __LSM_ID.0,
++                    );
++                }
++                0
++            }
++
++            // The lsm_info descriptor placed in the .lsm_info.init ELF section.
++            // The kernel's security_init() iterates this section to discover and
++            // call the init function of every compiled-in LSM.
++            // LsmInfo wraps lsm_info with `unsafe impl Sync` so it can be `static`.
++            #[used]
++            #[link_section = ".lsm_info.init"]
++            static __LSM_INFO: $crate::lsm::LsmInfo = {
++                // SAFETY: __LSM_ID and __lsm_init have 'static lifetime.
++                unsafe {
++                    $crate::lsm::new_lsm_info(
++                        &raw const __LSM_ID.0,
++                        Some(__lsm_init),
++                    )
++                }
++            };
++        }
++    };
++}
+-- 
+2.53.0
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH v2 4/5] security: add Rust LSM sample
+ (CONFIG_SECURITY_RUST_LSM)
+From: Jamie Lindsey <jamie@matrixforgelabs.com>
+Date: Wed, 11 Mar 2026 05:09:07 +0000
+Message-Id: <0102019cdb4c7651-ef972439-e74f-4ad9-84e7-34814d43cbc4-000000@eu-west-1.amazonses.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Add a minimal reference LSM written in Rust using the kernel::lsm
+abstraction layer introduced in the preceding patch.  The module:
+
+- Implements all three v1 hooks (file_open, task_alloc, task_free).
+- Logs each invocation via pr_info() and returns 0 (allow) for every
+  operation.  It enforces no policy.
+
+Purposes:
+1. Compile-test vehicle for kernel::lsm.
+2. API demonstration: shows exactly what an LSM author writes.
+3. Boot-test reference: if /sys/kernel/security/lsm lists
+   "rust_lsm_sample" after boot, hook registration works end-to-end.
+
+LSM_ID_UNDEF is used as the identity constant; a permanent LSM_ID_*
+value from include/uapi/linux/lsm.h will be requested as part of the
+upstream patch series.
+
+Activated via lsm= kernel command-line parameter or CONFIG_LSM Kconfig
+string.  Requires CONFIG_SECURITYFS=y for /sys/kernel/security/lsm to
+be visible.
+
+Compiled and boot-tested on Linux 7.0-rc2 (commit 4ae12d8bd9a8).
+
+Assisted-by: Claude:claude-sonnet-4-6
+Signed-off-by: Jamie Lindsey <jamie@matrixforgelabs.com>
+---
+ security/Kconfig              |  2 ++
+ security/Makefile             |  1 +
+ security/rust_lsm/Kconfig     | 14 ++++++++
+ security/rust_lsm/Makefile    |  2 ++
+ security/rust_lsm/rust_lsm.rs | 66 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 85 insertions(+)
+ create mode 100644 security/rust_lsm/Kconfig
+ create mode 100644 security/rust_lsm/Makefile
+ create mode 100644 security/rust_lsm/rust_lsm.rs
+
+diff --git a/security/Kconfig b/security/Kconfig
+index 6a4393fce9a1..fbd1ad4d36e8 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -301,6 +301,8 @@ config SECURITY_COMMONCAP_KUNIT_TEST
+ 
+ 	  If unsure, say N.
+ 
++source "security/rust_lsm/Kconfig"
++
+ source "security/Kconfig.hardening"
+ 
+ endmenu
+diff --git a/security/Makefile b/security/Makefile
+index 4601230ba442..f04f10a1592f 100644
+--- a/security/Makefile
++++ b/security/Makefile
+@@ -26,6 +26,7 @@ obj-$(CONFIG_CGROUPS)			+= device_cgroup.o
+ obj-$(CONFIG_BPF_LSM)			+= bpf/
+ obj-$(CONFIG_SECURITY_LANDLOCK)		+= landlock/
+ obj-$(CONFIG_SECURITY_IPE)		+= ipe/
++obj-$(CONFIG_SECURITY_RUST_LSM)		+= rust_lsm/
+ 
+ # Object integrity file lists
+ obj-$(CONFIG_INTEGRITY)			+= integrity/
+diff --git a/security/rust_lsm/Kconfig b/security/rust_lsm/Kconfig
+new file mode 100644
+index 000000000000..e2c3c45b9f7f
+--- /dev/null
++++ b/security/rust_lsm/Kconfig
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: GPL-2.0
++config SECURITY_RUST_LSM
++	bool "Rust LSM sample"
++	depends on SECURITY && RUST
++	help
++	  A minimal Linux Security Module written in Rust that demonstrates
++	  the kernel::lsm abstractions.  It logs file_open, task_alloc, and
++	  task_free events via pr_info().
++
++	  This module serves as a reference implementation and compile-test
++	  vehicle for the Rust LSM abstraction layer.  It imposes no policy
++	  — all hook implementations return 0 (allow) after logging.
++
++	  If unsure, say N.
+diff --git a/security/rust_lsm/Makefile b/security/rust_lsm/Makefile
+new file mode 100644
+index 000000000000..26a2319da08e
+--- /dev/null
++++ b/security/rust_lsm/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_SECURITY_RUST_LSM) += rust_lsm.o
+diff --git a/security/rust_lsm/rust_lsm.rs b/security/rust_lsm/rust_lsm.rs
+new file mode 100644
+index 000000000000..3afba383ef65
+--- /dev/null
++++ b/security/rust_lsm/rust_lsm.rs
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Rust LSM sample — reference implementation of the kernel::lsm abstractions.
++//!
++//! This module demonstrates how a Linux Security Module is written in Rust.
++//! It registers three hooks (file_open, task_alloc, task_free), logs each
++//! invocation via pr_info!(), and allows every operation.
++//!
++//! It is not a policy module — it enforces nothing.  Its purpose is to:
++//!
++//! 1. Serve as a compile-test vehicle for the kernel::lsm abstraction layer.
++//! 2. Demonstrate the API surface that upstream-bound LSMs should target.
++//! 3. Provide a boot-test reference: if the kernel boots with this LSM
++//!    enabled and /sys/kernel/security/lsm lists "rust_lsm_sample", the
++//!    hook registration machinery is working end-to-end.
++//!
++//! Assisted-by: Claude:claude-sonnet-4-6
++
++// The build system injects #![no_std] for all kernel Rust objects; do not repeat it.
++
++// Required by pr_info! and other kernel logging macros.
++const __LOG_PREFIX: &[u8] = b"rust_lsm_sample\0";
++
++use kernel::bindings;
++use kernel::lsm;
++use kernel::prelude::*;
++
++/// The Rust LSM sample implementation.
++struct RustLsmSample;
++
++impl lsm::Hooks for RustLsmSample {
++    fn file_open(file: &kernel::fs::File) -> Result {
++        pr_info!("rust_lsm: file_open flags={:#x}\n", file.flags());
++        Ok(())
++    }
++
++    fn task_alloc(task: &kernel::task::Task, clone_flags: u64) -> Result {
++        pr_info!(
++            "rust_lsm: task_alloc pid={} clone_flags={:#x}\n",
++            task.pid(),
++            clone_flags
++        );
++        Ok(())
++    }
++
++    fn task_free(task: &kernel::task::Task) {
++        pr_info!("rust_lsm: task_free pid={}\n", task.pid());
++    }
++}
++
++// Register RustLsmSample with the kernel LSM framework.
++//
++// This macro generates:
++//   - A static `lsm_id` identifying this module as "rust_lsm_sample".
++//   - A static `security_hook_list[3]` array (filled by C shims via LSM_HOOK_INIT).
++//   - An `unsafe extern "C"` init function that calls security_add_hooks().
++//   - A static `lsm_info` in the `.lsm_info.init` ELF section so that
++//     security_init() discovers and calls the init function at boot.
++//
++// LSM_ID_UNDEF is used during development.  A permanent LSM_ID_* value from
++// include/uapi/linux/lsm.h will be requested as part of the upstream patch series.
++kernel::define_lsm!(
++    RustLsmSample,
++    "rust_lsm_sample\0",
++    bindings::LSM_ID_UNDEF as u64
++);
+-- 
+2.53.0
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH v2 5/5] Documentation: rust: add LSM abstraction guide;
+ update MAINTAINERS
+From: Jamie Lindsey <jamie@matrixforgelabs.com>
+Date: Wed, 11 Mar 2026 05:09:08 +0000
+Message-Id: <0102019cdb4c7bbc-579d77fe-47b3-4bd0-ac5d-f677a6e0054c-000000@eu-west-1.amazonses.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Add Documentation/rust/lsm.rst, a developer guide for writing Linux
+Security Modules in Rust using the kernel::lsm abstraction layer.
+
+Covers:
+- The Hooks trait: per-hook semantics, return values, sleeping rules.
+- The define_lsm! macro: arguments and what it generates.
+- Kconfig and Makefile wiring patterns.
+- lsm_count.h: how to update MAX_LSM_COUNT for new built-in LSMs.
+- A complete minimal example.
+- Boot activation via lsm= and CONFIG_LSM.
+- v1 limitations (three hooks, one Rust LSM per build, no blob support).
+- C headers of interest for LSM authors.
+
+Link the new document from Documentation/rust/index.rst.
+
+Add a MAINTAINERS entry (RUST LSM ABSTRACTIONS) covering:
+  rust/helpers/lsm.c, rust/kernel/lsm.rs, security/rust_lsm/
+Listed on both rust-for-linux@vger.kernel.org and
+linux-security-module@vger.kernel.org.
+
+Assisted-by: Claude:claude-sonnet-4-6
+Signed-off-by: Jamie Lindsey <jamie@matrixforgelabs.com>
+---
+ Documentation/rust/index.rst |   1 +
+ Documentation/rust/lsm.rst   | 246 +++++++++++++++++++++++++++++++++++
+ MAINTAINERS                  |   9 ++
+ 3 files changed, 256 insertions(+)
+ create mode 100644 Documentation/rust/lsm.rst
+
+diff --git a/Documentation/rust/index.rst b/Documentation/rust/index.rst
+index b78ed0efa784..a4cb4bf8faf2 100644
+--- a/Documentation/rust/index.rst
++++ b/Documentation/rust/index.rst
+@@ -37,6 +37,7 @@ more details.
+     coding-guidelines
+     arch-support
+     testing
++    lsm
+ 
+ You can also find learning materials for Rust in its section in
+ :doc:`../process/kernel-docs`.
+diff --git a/Documentation/rust/lsm.rst b/Documentation/rust/lsm.rst
+new file mode 100644
+index 000000000000..c4e16e7d2be5
+--- /dev/null
++++ b/Documentation/rust/lsm.rst
+@@ -0,0 +1,246 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++Linux Security Modules in Rust
++================================
++
++This document describes how to write a Linux Security Module (LSM) using
++the Rust abstractions provided in ``rust/kernel/lsm.rs``.
++
++
++Overview
++--------
++
++The LSM framework allows security policies to be implemented as kernel
++modules that register hooks into security-sensitive operations.  Traditionally
++these are written in C; the Rust abstraction layer provides a safe,
++trait-based interface that enforces correct hook registration at compile time.
++
++A Rust LSM:
++
++1. Implements the :ref:`Hooks trait <rust_lsm_hooks_trait>` for the subset
++   of hooks it cares about.
++2. Registers itself at boot time using the :ref:`define_lsm! macro
++   <rust_lsm_define_macro>`.
++
++No C code is required by the LSM author.  The abstraction layer generates
++the necessary C-callable adapter functions and places the ``lsm_info``
++descriptor in the ``.lsm_info.init`` ELF section, where
++``security_init()`` discovers it during boot.
++
++
++.. _rust_lsm_hooks_trait:
++
++The ``Hooks`` trait
++-------------------
++
++``kernel::lsm::Hooks`` is the central trait.  Each method corresponds to one
++LSM hook.  All methods have a default no-op implementation, so an implementor
++only needs to override the hooks it cares about::
++
++    pub trait Hooks: Sync + Send + 'static {
++        fn file_open(_file: &File) -> Result { Ok(()) }
++        fn task_alloc(_task: &Task, _clone_flags: u64) -> Result { Ok(()) }
++        fn task_free(_task: &Task) {}
++    }
++
++The ``Sync + Send + 'static`` bounds are required because hook functions may
++be called concurrently from any CPU.
++
++Return values
++~~~~~~~~~~~~~
++
++Hooks that can deny an operation return ``kernel::error::Result``:
++
++- ``Ok(())`` — allow the operation.
++- ``Err(e)`` — deny the operation; ``e.to_errno()`` is returned to the caller.
++
++Common denial error codes:
++
++- ``EACCES`` — permission denied (policy decision).
++- ``EPERM`` — operation not permitted (capability check).
++
++The ``task_free`` hook cannot deny anything and has no return value.
++
++Sleeping
++~~~~~~~~
++
++``task_free`` is called in a non-sleeping context.  Implementations **must
++not** sleep or allocate memory with ``GFP_KERNEL`` inside ``task_free``.
++All other hooks may sleep unless the call site is documented otherwise.
++
++
++Available hooks (v1)
++~~~~~~~~~~~~~~~~~~~~~
++
++.. list-table::
++   :widths: 25 75
++   :header-rows: 1
++
++   * - Hook
++     - When called
++   * - ``file_open``
++     - A file is being opened.  Return ``Err`` to deny the open.
++   * - ``task_alloc``
++     - A new task (thread or process) is being created via ``clone(2)``
++       or ``fork(2)``.  ``clone_flags`` contains the ``CLONE_*`` flags.
++       Return ``Err`` to deny creation.
++   * - ``task_free``
++     - A task is being freed.  Must not sleep.  Use this to clean up any
++       per-task state associated with the LSM.
++
++
++.. _rust_lsm_define_macro:
++
++The ``define_lsm!`` macro
++--------------------------
++
++``kernel::define_lsm!`` registers a type implementing ``Hooks`` with the
++kernel LSM framework::
++
++    kernel::define_lsm!(MyLsmType, "my_lsm\0", bindings::LSM_ID_UNDEF as u64);
++
++Arguments:
++
++.. list-table::
++   :widths: 20 80
++   :header-rows: 1
++
++   * - Argument
++     - Description
++   * - ``$T``
++     - The type implementing ``Hooks``.  Must be ``Sync + Send + 'static``.
++   * - ``$name``
++     - A ``&str`` literal with a NUL terminator (``\0``).  This name is used
++       in ``/sys/kernel/security/lsm`` and in the ``lsm=`` kernel command-line
++       parameter.
++   * - ``$id``
++     - The LSM identity constant from ``include/uapi/linux/lsm.h``.  Use
++       ``bindings::LSM_ID_UNDEF as u64`` during development; request a
++       permanent value as part of the upstream patch series.
++
++The macro generates:
++
++- A ``static __LSM_ID: LsmId`` holding the LSM identity.
++- A ``static mut __LSM_HOOKS`` array of ``MaybeUninit<security_hook_list>``
++  entries, one per registered hook.
++- An ``unsafe extern "C" fn __lsm_init()`` that fills each hook slot using
++  the C ``LSM_HOOK_INIT`` shim (necessary because ``security_hook_list`` has
++  ``__randomize_layout``) and calls ``security_add_hooks()``.
++- A ``static __LSM_INFO: LsmInfo`` in the ``.lsm_info.init`` ELF section,
++  which ``security_init()`` iterates at boot to discover and call the init
++  function.
++
++
++Enabling in Kconfig
++-------------------
++
++To include a Rust LSM in the build, add a ``Kconfig`` entry that selects
++``RUST`` and depends on ``SECURITY``::
++
++    config SECURITY_MY_LSM
++        bool "My Rust LSM"
++        depends on SECURITY
++        select RUST
++        help
++          A minimal Rust LSM that ...
++
++Wire the object into the build in ``security/Makefile``::
++
++    obj-$(CONFIG_SECURITY_MY_LSM) += my_lsm/
++
++And in ``security/my_lsm/Makefile``::
++
++    obj-$(CONFIG_SECURITY_MY_LSM) += my_lsm.o
++
++The source file must **not** declare ``#![no_std]`` — the build system injects
++it automatically for all kernel Rust objects.
++
++Define ``__LOG_PREFIX`` at the top of the source file so that ``pr_info!`` and
++friends work correctly::
++
++    const __LOG_PREFIX: &[u8] = b"my_lsm\0";
++
++
++Minimal example
++---------------
++
++The following is a complete, minimal Rust LSM that logs every file open and
++allows all operations::
++
++    // SPDX-License-Identifier: GPL-2.0
++
++    //! Minimal Rust LSM example.
++
++    const __LOG_PREFIX: &[u8] = b"my_lsm\0";
++
++    use kernel::bindings;
++    use kernel::lsm;
++    use kernel::prelude::*;
++
++    struct MyLsm;
++
++    impl lsm::Hooks for MyLsm {
++        fn file_open(file: &kernel::fs::File) -> Result {
++            pr_info!("file_open: flags={:#x}\n", file.flags());
++            Ok(())
++        }
++    }
++
++    kernel::define_lsm!(MyLsm, "my_lsm\0", bindings::LSM_ID_UNDEF as u64);
++
++The reference implementation is at ``security/rust_lsm/rust_lsm.rs``
++(``CONFIG_SECURITY_RUST_LSM``).
++
++
++Activating at boot
++------------------
++
++A Rust LSM compiled into the kernel is activated by listing its name in the
++``lsm=`` kernel command-line parameter or by adding it to the ``CONFIG_LSM``
++Kconfig string.
++
++The LSM name must also be counted in ``include/linux/lsm_count.h`` so that
++``MAX_LSM_COUNT`` is large enough to accommodate it alongside other compiled-in
++LSMs.  Add a ``CONFIG_SECURITY_MY_LSM``-guarded macro alongside the existing
++entries::
++
++    #ifdef CONFIG_SECURITY_MY_LSM
++    #define MY_LSM_ENABLED 1,
++    #else
++    #define MY_LSM_ENABLED
++    #endif
++
++    #define MAX_LSM_COUNT \
++        COUNT_LSMS( \
++            ...existing entries... \
++            MY_LSM_ENABLED)
++
++To verify the LSM is active after boot::
++
++    cat /sys/kernel/security/lsm
++
++
++Limitations (v1)
++-----------------
++
++- Only three hooks are available: ``file_open``, ``task_alloc``, and
++  ``task_free``.  Additional hooks will be added in follow-up patches as safe
++  Rust wrappers for their argument types are contributed upstream.
++
++- At most one Rust LSM can be registered per kernel build with the current
++  macro design.  Supporting multiple Rust LSMs requires unique static symbol
++  generation, planned for v2 using a proc-macro.
++
++- No security blob support.  Per-task or per-inode data associated with a
++  Rust LSM requires the ``SecurityBlob<T>`` abstraction planned for v2.
++
++
++C headers of interest
++---------------------
++
++- ``include/linux/lsm_hooks.h`` — ``lsm_info``, ``security_hook_list``,
++  ``LSM_HOOK_INIT``, ``LSM_ORDER_*``.
++- ``include/linux/lsm_hook_defs.h`` — canonical hook signatures.
++- ``include/uapi/linux/lsm.h`` — ``LSM_ID_*`` constants.
++- ``include/linux/lsm_count.h`` — ``MAX_LSM_COUNT`` computation.
++- ``security/security.c`` — ``security_init()``, ``security_add_hooks()``.
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 89007f9ed35e..a23f5a15e038 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -23196,6 +23196,15 @@ S:	Maintained
+ T:	git https://github.com/Rust-for-Linux/linux.git rust-analyzer-next
+ F:	scripts/generate_rust_analyzer.py
+ 
++RUST LSM ABSTRACTIONS
++M:	Jamie Lindsey <jamie@matrixforgelabs.com>
++L:	rust-for-linux@vger.kernel.org
++L:	linux-security-module@vger.kernel.org
++S:	Maintained
++F:	rust/helpers/lsm.c
++F:	rust/kernel/lsm.rs
++F:	security/rust_lsm/
++
+ RXRPC SOCKETS (AF_RXRPC)
+ M:	David Howells <dhowells@redhat.com>
+ M:	Marc Dionne <marc.dionne@auristor.com>
+-- 
+2.53.0
+

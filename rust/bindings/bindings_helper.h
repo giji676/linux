@@ -84,7 +84,6 @@
 #include <linux/regulator/consumer.h>
 #include <linux/sched.h>
 #include <linux/security.h>
-#include <linux/lsm_hooks.h> // MYEDIT
 #include <linux/slab.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
