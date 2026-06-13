@@ -27,5 +27,8 @@ obj-$(CONFIG_BPF_LSM)			+= bpf/
 obj-$(CONFIG_SECURITY_LANDLOCK)		+= landlock/
 obj-$(CONFIG_SECURITY_IPE)		+= ipe/
 
+# MYEDIT
+obj-$(CONFIG_SECURITY_GIJI)		+= giji/
+
 # Object integrity file lists
 obj-$(CONFIG_INTEGRITY)			+= integrity/

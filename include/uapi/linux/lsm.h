@@ -66,6 +66,8 @@ struct lsm_ctx {
 #define LSM_ID_EVM		112
 #define LSM_ID_IPE		113
 
+// MYEDIT
+#define LSM_ID_GIJI		114
 /*
  * LSM_ATTR_XXX definitions identify different LSM attributes
  * which are used in the kernel's LSM userspace API. Support
