@@ -8,6 +8,7 @@
  * Copyright (C) 2011 The Chromium OS Authors.
  */
 
+#include <linux/yama_lsm.h>
 #include <linux/lsm_hooks.h>
 #include <linux/sysctl.h>
 #include <linux/ptrace.h>
@@ -26,15 +27,7 @@
 #define YAMA_SCOPE_NO_ATTACH	3
 
 static int ptrace_scope = YAMA_SCOPE_RELATIONAL;
-
-/* describe a ptrace relationship for potential exception */
-struct ptrace_relation {
-	struct task_struct *tracer;
-	struct task_struct *tracee;
-	bool invalid;
-	struct list_head node;
-	struct rcu_head rcu;
-};
+// static int ptrace_scope = YAMA_SCOPE_NO_ATTACH;
 
 static LIST_HEAD(ptracer_relations);
 static DEFINE_SPINLOCK(ptracer_relations_lock);
@@ -48,6 +41,42 @@ struct access_report_info {
 	struct task_struct *target;
 	struct task_struct *agent;
 };
+
+// Defined in the yama header
+struct list_head *rust_read_once_list_next(struct list_head *node)
+{
+    return READ_ONCE(node->next);
+}
+
+bool rust_read_once_bool(bool *p)
+{
+    return READ_ONCE(*p);
+}
+
+struct task_struct *rust_read_once_task(struct task_struct **p)
+{
+    return READ_ONCE(*p);
+}
+
+struct list_head *rust_ptracer_relations(void)
+{
+	return &ptracer_relations;
+}
+
+struct work_struct *rust_yama_relation_work(void)
+{
+	return &yama_relation_work;
+}
+
+void rust_schedule_work(struct work_struct *work)
+{
+    schedule_work(work);
+}
+
+int rust_task_pid_nr(struct task_struct *task)
+{
+    return task_pid_nr(task);
+}
 
 static void __report_access(struct callback_head *work)
 {
@@ -141,6 +170,11 @@ static void yama_relation_cleanup(struct work_struct *work)
 static int yama_ptracer_add(struct task_struct *tracer,
 			    struct task_struct *tracee)
 {
+	pr_info("YAMA: ptracer_add ");
+	if (tracer)
+		pr_info("tracer=%d tracee=%d", tracer->pid, tracee->pid);
+	else
+		pr_info("tracer=ANY tracee=%d", tracee->pid);
 	struct ptrace_relation *relation, *added;
 
 	added = kmalloc_obj(*added);
@@ -171,7 +205,11 @@ out:
 	return 0;
 }
 
+extern int rust_yama_ptracer_del(struct task_struct *tracer,
+				 struct task_struct *tracee);
+
 /**
+ *
  * yama_ptracer_del - remove exceptions related to the given tasks
  * @tracer: remove any relation where tracer task matches
  * @tracee: remove any relation where tracee task matches
@@ -179,6 +217,10 @@ out:
 static void yama_ptracer_del(struct task_struct *tracer,
 			     struct task_struct *tracee)
 {
+	pr_info("YAMA: yama_ptracer_del\n");
+	rust_yama_ptracer_del(tracer, tracee);
+
+	/*
 	struct ptrace_relation *relation;
 	bool marked = false;
 
@@ -196,6 +238,7 @@ static void yama_ptracer_del(struct task_struct *tracer,
 
 	if (marked)
 		schedule_work(&yama_relation_work);
+	 */
 }
 
 /**
@@ -204,6 +247,7 @@ static void yama_ptracer_del(struct task_struct *tracer,
  */
 static void yama_task_free(struct task_struct *task)
 {
+	// pr_info("yama_task_free\n");
 	yama_ptracer_del(task, task);
 }
 
@@ -221,6 +265,7 @@ static void yama_task_free(struct task_struct *task)
 static int yama_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 			   unsigned long arg4, unsigned long arg5)
 {
+	// pr_info("yama_task_prctl\n");
 	int rc = -ENOSYS;
 	struct task_struct *myself;
 
@@ -349,6 +394,7 @@ unlock:
 static int yama_ptrace_access_check(struct task_struct *child,
 				    unsigned int mode)
 {
+	// pr_info("yama_ptrace_access_check\n");
 	int rc = 0;
 
 	/* require ptrace target be a child of ptracer on attach */
@@ -394,6 +440,8 @@ static int yama_ptrace_access_check(struct task_struct *child,
  */
 static int yama_ptrace_traceme(struct task_struct *parent)
 {
+	// pr_info("yama_ptrace_traceme\n");
+	pr_info("YAMA: yama_prace_traceme tracer parent pid: %d\n", parent->pid);
 	int rc = 0;
 
 	/* Only disallow PTRACE_TRACEME on more aggressive settings. */

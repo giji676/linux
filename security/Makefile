@@ -26,8 +26,6 @@ obj-$(CONFIG_CGROUPS)			+= device_cgroup.o
 obj-$(CONFIG_BPF_LSM)			+= bpf/
 obj-$(CONFIG_SECURITY_LANDLOCK)		+= landlock/
 obj-$(CONFIG_SECURITY_IPE)		+= ipe/
-# SPDX-License-Identifier: GPL-2.0
-obj-$(CONFIG_SECURITY_RUST_LSM) += rust_lsm.o
 
 # MYEDIT
 obj-$(CONFIG_SECURITY_GIJI)		+= giji/
