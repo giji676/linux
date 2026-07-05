@@ -28,7 +28,16 @@ unsafe extern "C" fn rust_inode_handler(
     _inode: *mut bindings::inode,
     _mask: core::ffi::c_int,
 ) -> i32 {
-    pr_info!("inode_handler call\n");
+    // pr_info!("inode_handler call\n");
+    0
+        // -(bindings::EPERM as i32)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn rust_file_open_handler(
+    _inode: *mut bindings::file
+) -> i32 {
+    // pr_info!("file_open call\n");
     0
         // -(bindings::EPERM as i32)
 }
