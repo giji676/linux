@@ -1,6 +1,7 @@
 use kernel::prelude::*;
 use kernel::bindings;
 use core::mem::offset_of;
+use core::ffi;
 
 // LOG_PREFIX for pr_info! macro
 const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
@@ -59,7 +60,7 @@ pub unsafe fn list_entry_rcu<T>(
     }
 }
 
-/// yama_pracer_del written in Rust
+/// yama_ptracer_del written in Rust
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_yama_ptracer_del(
     tracer: *mut bindings::task_struct,
@@ -75,16 +76,14 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
         list_for_each_entry_rcu(
             bindings::rust_ptracer_relations(),
             |relation| {
-                unsafe {
-                    pr_info!(
-                        "tracer pid = {}\n",
-                        bindings::rust_task_pid_nr(tracer)
-                    );
-                    pr_info!(
-                        "tracee pid = {}\n",
-                        bindings::rust_task_pid_nr(tracee)
-                    );
-                }
+                pr_info!(
+                    "tracer pid = {}\n",
+                    bindings::rust_task_pid_nr(tracer)
+                );
+                pr_info!(
+                    "tracee pid = {}\n",
+                    bindings::rust_task_pid_nr(tracee)
+                );
 
                 if (*relation).invalid {
                     return;
@@ -107,4 +106,19 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
             );
         }
     }
+}
+
+/// yama_ptrace_traceme written in Rust
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_yama_ptrace_traceme(
+    parent: *mut bindings::task_struct,
+    ptrace_scope: ffi::c_int
+) -> ffi::c_int {
+    pr_info!("rust_yama_ptrace_traceme\n");
+
+    if ptrace_scope == bindings::YAMA_SCOPE_NO_ATTACH as ffi::c_int {
+        return -(bindings::EPERM as c_int);
+    }
+    
+    0
 }

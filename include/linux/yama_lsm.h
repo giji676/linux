@@ -4,6 +4,11 @@
 #include "linux/types.h"
 #include <linux/list.h>
 
+#define YAMA_SCOPE_DISABLED	0
+#define YAMA_SCOPE_RELATIONAL	1
+#define YAMA_SCOPE_CAPABILITY	2
+#define YAMA_SCOPE_NO_ATTACH	3
+
 /* describe a ptrace relationship for potential exception */
 struct ptrace_relation {
 	struct task_struct *tracer;

@@ -21,11 +21,6 @@
 #include <linux/spinlock.h>
 #include <uapi/linux/lsm.h>
 
-#define YAMA_SCOPE_DISABLED	0
-#define YAMA_SCOPE_RELATIONAL	1
-#define YAMA_SCOPE_CAPABILITY	2
-#define YAMA_SCOPE_NO_ATTACH	3
-
 static int ptrace_scope = YAMA_SCOPE_RELATIONAL;
 // static int ptrace_scope = YAMA_SCOPE_NO_ATTACH;
 
@@ -432,6 +427,8 @@ static int yama_ptrace_access_check(struct task_struct *child,
 	return rc;
 }
 
+extern int rust_yama_ptrace_traceme(struct task_struct *parent, int scope);
+
 /**
  * yama_ptrace_traceme - validate PTRACE_TRACEME calls
  * @parent: task that will become the ptracer of the current task
@@ -440,9 +437,14 @@ static int yama_ptrace_access_check(struct task_struct *child,
  */
 static int yama_ptrace_traceme(struct task_struct *parent)
 {
-	// pr_info("yama_ptrace_traceme\n");
 	pr_info("YAMA: yama_prace_traceme tracer parent pid: %d\n", parent->pid);
+	// TODO: return with the rust function call
 	int rc = 0;
+	rc = rust_yama_ptrace_traceme(parent, ptrace_scope);
+	if (rc) {
+		pr_info("returned rc: %d from rust\n", rc);
+		return rc;
+	}
 
 	/* Only disallow PTRACE_TRACEME on more aggressive settings. */
 	switch (ptrace_scope) {
