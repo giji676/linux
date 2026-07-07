@@ -1,6 +1,7 @@
 use kernel::prelude::*;
 use kernel::bindings;
 use core::mem::offset_of;
+use kernel::sync::rcu::Guard;
 
 // LOG_PREFIX for pr_info! macro
 const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
@@ -69,22 +70,20 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 
     let mut marked = false;
 
-    unsafe {
-        bindings::rcu_read_lock();
+    let guard = Guard::new();
 
+    unsafe {
         list_for_each_entry_rcu(
             bindings::rust_ptracer_relations(),
             |relation| {
-                unsafe {
-                    pr_info!(
-                        "tracer pid = {}\n",
-                        bindings::rust_task_pid_nr(tracer)
-                    );
-                    pr_info!(
-                        "tracee pid = {}\n",
-                        bindings::rust_task_pid_nr(tracee)
-                    );
-                }
+                pr_info!(
+                    "tracer pid = {}\n",
+                    bindings::rust_task_pid_nr(tracer)
+                );
+                pr_info!(
+                    "tracee pid = {}\n",
+                    bindings::rust_task_pid_nr(tracee)
+                );
 
                 if (*relation).invalid {
                     return;
@@ -98,13 +97,16 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
                 }
             },
         );
+    }
 
-        bindings::rcu_read_unlock();
+    guard.unlock();
 
+    unsafe {
         if marked {
             bindings::rust_schedule_work(
                 bindings::rust_yama_relation_work(),
             );
         }
     }
+
 }
