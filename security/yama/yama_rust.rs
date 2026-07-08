@@ -9,22 +9,24 @@ const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
 /// Kernel C functions in Rust.
 /// Should be moved to srctree/linux/rust/ and rewritten as
 /// proper, safe abstractions.
-pub unsafe fn list_for_each_entry_rcu<F>(
-    head: *mut bindings::list_head,
-    mut f: F,
-)
-where
-    F: FnMut(*mut bindings::ptrace_relation),
-{
-    unsafe {
-        let mut rel = list_entry_rcu!((*head).next, bindings::ptrace_relation, node);
+#[macro_export]
+macro_rules! list_for_each_entry_rcu {
+    ($pos:ident, $head:expr, $container:ty, $member:ident, $body:block) => {{
+        unsafe {
+            let mut $pos =
+                list_entry_rcu!((*$head).next, $container, $member);
 
-        while core::ptr::addr_of!((*rel).node) != head {
-            f(rel);
+            while core::ptr::addr_of!((*$pos).$member) != $head {
+                $body
 
-            let mut rel = list_entry_rcu!((*rel).node.next, bindings::ptrace_relation, node);
+                $pos = list_entry_rcu!(
+                    (*$pos).$member.next,
+                    $container,
+                    $member
+                );
+            }
         }
-    }
+    }};
 }
 
 #[inline(always)]
@@ -42,7 +44,7 @@ macro_rules! container_of {
                 (*core::ptr::NonNull::<$container>::dangling().as_ptr()).$field
             );
 
-        assert_same_type(__ptr, __field_ptr);
+        assert_same_type(__ptr as *const _, __field_ptr);
 
         unsafe {
             (__ptr as *const u8)
@@ -56,7 +58,7 @@ macro_rules! container_of {
 macro_rules! list_entry_rcu {
     ($_ptr:expr, $_type:ty, $_member:ident) => {{
         unsafe {
-            container_of!(bindings::rust_read_once_list_next($_ptr), $_type, $_member)
+            container_of!(bindings::rust_read_once($_ptr), $_type, $_member)
         }
     }};
 }
@@ -74,9 +76,12 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
     let guard = Guard::new();
 
     unsafe {
-        list_for_each_entry_rcu(
+        list_for_each_entry_rcu!(
+            pos,
             bindings::rust_ptracer_relations(),
-            |relation| {
+            bindings::ptrace_relation,
+            node,
+            {
                 pr_info!(
                     "tracer pid = {}\n",
                     bindings::rust_task_pid_nr(tracer)
@@ -86,17 +91,17 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
                     bindings::rust_task_pid_nr(tracee)
                 );
 
-                if (*relation).invalid {
-                    return;
+                if (*pos).invalid {
+                    continue;
                 }
 
-                if (*relation).tracee == tracee
-                    || (!tracer.is_null() && (*relation).tracer == tracer)
+                if (*pos).tracee == tracee
+                    || (!tracer.is_null() && (*pos).tracer == tracer)
                 {
-                    (*relation).invalid = true;
+                    (*pos).invalid = true;
                     marked = true;
                 }
-            },
+            }
         );
     }
 
