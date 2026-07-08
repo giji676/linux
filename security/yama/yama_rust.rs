@@ -16,48 +16,49 @@ pub unsafe fn list_for_each_entry_rcu<F>(
 where
     F: FnMut(*mut bindings::ptrace_relation),
 {
-    let offset = offset_of!(bindings::ptrace_relation, node);
-
     unsafe {
-        let mut rel = list_entry_rcu::<bindings::ptrace_relation>(
-            (*head).next,
-            offset,
-        );
+        let mut rel = list_entry_rcu!((*head).next, bindings::ptrace_relation, node);
 
         while core::ptr::addr_of!((*rel).node) != head {
             f(rel);
 
-            rel = list_entry_rcu::<bindings::ptrace_relation>(
-                (*rel).node.next,
-                offset,
-            );
+            let mut rel = list_entry_rcu!((*rel).node.next, bindings::ptrace_relation, node);
         }
     }
 }
 
 #[inline(always)]
-pub const fn list_check_rcu() {}
+fn assert_same_type<T>(_: *const T, _: *const T) {}
 
-#[inline(always)]
-pub unsafe fn container_of<T>(
-    ptr: *const u8,
-    offset: usize,
-) -> *mut T {
-    unsafe {
-        ptr.sub(offset) as *mut T
-    }
+#[macro_export]
+macro_rules! container_of {
+    ($ptr:expr, $container:ty, $field:ident) => {{
+        let __ptr = $ptr;
+
+        // Checks if a field is a member of the given container
+        // if it isn't compiler will complain
+        let __field_ptr =
+            core::ptr::addr_of!(
+                (*core::ptr::NonNull::<$container>::dangling().as_ptr()).$field
+            );
+
+        assert_same_type(__ptr, __field_ptr);
+
+        unsafe {
+            (__ptr as *const u8)
+                .sub(core::mem::offset_of!($container, $field))
+                as *mut $container
+        }
+    }};
 }
 
-#[inline(always)]
-pub unsafe fn list_entry_rcu<T>(
-    ptr: *mut bindings::list_head,
-    offset: usize,
-) -> *mut T {
-    
-    unsafe {
-        let ptr = bindings::rust_read_once_list_next(ptr);
-        container_of::<T>(ptr as *const u8, offset) as *mut T
-    }
+#[macro_export]
+macro_rules! list_entry_rcu {
+    ($_ptr:expr, $_type:ty, $_member:ident) => {{
+        unsafe {
+            container_of!(bindings::rust_read_once_list_next($_ptr), $_type, $_member)
+        }
+    }};
 }
 
 /// yama_pracer_del written in Rust
