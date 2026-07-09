@@ -1,6 +1,5 @@
 use kernel::prelude::*;
 use kernel::bindings;
-use core::mem::offset_of;
 use core::ffi;
 use kernel::sync::rcu::Guard;
 
@@ -47,20 +46,16 @@ macro_rules! container_of {
 
         assert_same_type(__ptr as *const _, __field_ptr);
 
-        unsafe {
-            (__ptr as *const u8)
-                .sub(core::mem::offset_of!($container, $field))
-                as *mut $container
-        }
+        (__ptr as *const u8)
+            .sub(core::mem::offset_of!($container, $field))
+            as *mut $container
     }};
 }
 
 #[macro_export]
 macro_rules! list_entry_rcu {
     ($_ptr:expr, $_type:ty, $_member:ident) => {{
-        unsafe {
-            container_of!(bindings::rust_read_once($_ptr), $_type, $_member)
-        }
+        container_of!(bindings::rust_read_once($_ptr), $_type, $_member)
     }};
 }
 
@@ -76,35 +71,33 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 
     let guard = Guard::new();
 
-    unsafe {
-        list_for_each_entry_rcu!(
-            pos,
-            bindings::rust_ptracer_relations(),
-            bindings::ptrace_relation,
-            node,
-            {
-                pr_info!(
-                    "tracer pid = {}\n",
-                    bindings::rust_task_pid_nr(tracer)
-                );
-                pr_info!(
-                    "tracee pid = {}\n",
-                    bindings::rust_task_pid_nr(tracee)
-                );
+    list_for_each_entry_rcu!(
+        pos,
+        bindings::rust_ptracer_relations(),
+        bindings::ptrace_relation,
+        node,
+        {
+            pr_info!(
+                "tracer pid = {}\n",
+                bindings::rust_task_pid_nr(tracer)
+            );
+            pr_info!(
+                "tracee pid = {}\n",
+                bindings::rust_task_pid_nr(tracee)
+            );
 
-                if (*pos).invalid {
-                    continue;
-                }
-
-                if (*pos).tracee == tracee
-                    || (!tracer.is_null() && (*pos).tracer == tracer)
-                {
-                    (*pos).invalid = true;
-                    marked = true;
-                }
+            if (*pos).invalid {
+                continue;
             }
-        );
-    }
+
+            if (*pos).tracee == tracee
+                || (!tracer.is_null() && (*pos).tracer == tracer)
+            {
+                (*pos).invalid = true;
+                marked = true;
+            }
+        }
+    );
 
     guard.unlock();
 
@@ -118,6 +111,36 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 
 }
 
+// bool has_ns_capability(struct task_struct *t,
+// 		       struct user_namespace *ns, int cap)
+// {
+// 	int ret;
+//
+// 	rcu_read_lock();
+// 	ret = security_capable(__task_cred(t), ns, cap, CAP_OPT_NONE);
+// 	rcu_read_unlock();
+//
+// 	return (ret == 0);
+// }
+fn has_ns_capability(
+    t: *mut bindings::task_struct,
+    ns: *mut bindings::user_namespace,
+    cap: ffi::c_int,
+) -> bool {
+    let ret: ffi::c_int;
+    let guard = Guard::new();
+    unsafe {
+        ret = bindings::security_capable(
+            bindings::rust_task_cred(t),
+            ns,
+            cap,
+            bindings::CAP_OPT_NONE,
+        );
+    }
+    guard.unlock();
+    ret == 0
+}
+
 /// yama_ptrace_traceme written in Rust
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_yama_ptrace_traceme(
@@ -126,9 +149,23 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
 ) -> ffi::c_int {
     pr_info!("rust_yama_ptrace_traceme\n");
 
-    if ptrace_scope == bindings::YAMA_SCOPE_NO_ATTACH as ffi::c_int {
-        return -(bindings::EPERM as c_int);
+    match ptrace_scope {
+        val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
+            unsafe {
+                if !has_ns_capability(
+                    parent,
+                    bindings::rust_current_user_ns(),
+                    bindings::CAP_SYS_PTRACE as ffi::c_int,
+                ) {
+                    return -(bindings::EPERM as c_int);
+                }
+            }
+        }
+        val if val == bindings::YAMA_SCOPE_NO_ATTACH as ffi::c_int => {
+            return -(bindings::EPERM as c_int);
+        }
+        _ => {
+        }
     }
-    
     0
 }

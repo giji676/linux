@@ -21,8 +21,9 @@
 #include <linux/spinlock.h>
 #include <uapi/linux/lsm.h>
 
-static int ptrace_scope = YAMA_SCOPE_RELATIONAL;
+// static int ptrace_scope = YAMA_SCOPE_RELATIONAL;
 // static int ptrace_scope = YAMA_SCOPE_NO_ATTACH;
+static int ptrace_scope = YAMA_SCOPE_CAPABILITY;
 
 static LIST_HEAD(ptracer_relations);
 static DEFINE_SPINLOCK(ptracer_relations_lock);
@@ -71,6 +72,16 @@ void rust_schedule_work(struct work_struct *work)
 int rust_task_pid_nr(struct task_struct *task)
 {
     return task_pid_nr(task);
+}
+
+const struct cred *rust_task_cred(struct task_struct *task)
+{
+    return __task_cred(task);
+}
+
+struct user_namespace *rust_current_user_ns(void)
+{
+    return current_user_ns();
 }
 
 static void __report_access(struct callback_head *work)
@@ -438,24 +449,8 @@ extern int rust_yama_ptrace_traceme(struct task_struct *parent, int scope);
 static int yama_ptrace_traceme(struct task_struct *parent)
 {
 	pr_info("YAMA: yama_prace_traceme tracer parent pid: %d\n", parent->pid);
-	// TODO: return with the rust function call
 	int rc = 0;
 	rc = rust_yama_ptrace_traceme(parent, ptrace_scope);
-	if (rc) {
-		pr_info("returned rc: %d from rust\n", rc);
-		return rc;
-	}
-
-	/* Only disallow PTRACE_TRACEME on more aggressive settings. */
-	switch (ptrace_scope) {
-	case YAMA_SCOPE_CAPABILITY:
-		if (!has_ns_capability(parent, current_user_ns(), CAP_SYS_PTRACE))
-			rc = -EPERM;
-		break;
-	case YAMA_SCOPE_NO_ATTACH:
-		rc = -EPERM;
-		break;
-	}
 
 	if (rc) {
 		task_lock(current);

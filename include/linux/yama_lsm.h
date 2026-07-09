@@ -25,5 +25,7 @@ struct list_head *rust_ptracer_relations(void);
 struct work_struct *rust_yama_relation_work(void);
 void rust_schedule_work(struct work_struct *work);
 int rust_task_pid_nr(struct task_struct *task);
+const struct cred *rust_task_cred(struct task_struct *task);
+struct user_namespace *rust_current_user_ns(void);
 
 #endif
