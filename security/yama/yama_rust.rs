@@ -2,6 +2,7 @@ use kernel::prelude::*;
 use kernel::bindings;
 use core::mem::offset_of;
 use core::ffi;
+use kernel::sync::rcu::Guard;
 
 // LOG_PREFIX for pr_info! macro
 const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
@@ -9,55 +10,58 @@ const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
 /// Kernel C functions in Rust.
 /// Should be moved to srctree/linux/rust/ and rewritten as
 /// proper, safe abstractions.
-pub unsafe fn list_for_each_entry_rcu<F>(
-    head: *mut bindings::list_head,
-    mut f: F,
-)
-where
-    F: FnMut(*mut bindings::ptrace_relation),
-{
-    let offset = offset_of!(bindings::ptrace_relation, node);
+#[macro_export]
+macro_rules! list_for_each_entry_rcu {
+    ($pos:ident, $head:expr, $container:ty, $member:ident, $body:block) => {{
+        unsafe {
+            let mut $pos =
+                list_entry_rcu!((*$head).next, $container, $member);
 
-    unsafe {
-        let mut rel = list_entry_rcu::<bindings::ptrace_relation>(
-            (*head).next,
-            offset,
-        );
+            while core::ptr::addr_of!((*$pos).$member) != $head {
+                $body
 
-        while core::ptr::addr_of!((*rel).node) != head {
-            f(rel);
-
-            rel = list_entry_rcu::<bindings::ptrace_relation>(
-                (*rel).node.next,
-                offset,
-            );
+                $pos = list_entry_rcu!(
+                    (*$pos).$member.next,
+                    $container,
+                    $member
+                );
+            }
         }
-    }
+    }};
 }
 
 #[inline(always)]
-pub const fn list_check_rcu() {}
+fn assert_same_type<T>(_: *const T, _: *const T) {}
 
-#[inline(always)]
-pub unsafe fn container_of<T>(
-    ptr: *const u8,
-    offset: usize,
-) -> *mut T {
-    unsafe {
-        ptr.sub(offset) as *mut T
-    }
+#[macro_export]
+macro_rules! container_of {
+    ($ptr:expr, $container:ty, $field:ident) => {{
+        let __ptr = $ptr;
+
+        // Checks if a field is a member of the given container
+        // if it isn't compiler will complain
+        let __field_ptr =
+            core::ptr::addr_of!(
+                (*core::ptr::NonNull::<$container>::dangling().as_ptr()).$field
+            );
+
+        assert_same_type(__ptr as *const _, __field_ptr);
+
+        unsafe {
+            (__ptr as *const u8)
+                .sub(core::mem::offset_of!($container, $field))
+                as *mut $container
+        }
+    }};
 }
 
-#[inline(always)]
-pub unsafe fn list_entry_rcu<T>(
-    ptr: *mut bindings::list_head,
-    offset: usize,
-) -> *mut T {
-    
-    unsafe {
-        let ptr = bindings::rust_read_once_list_next(ptr);
-        container_of::<T>(ptr as *const u8, offset) as *mut T
-    }
+#[macro_export]
+macro_rules! list_entry_rcu {
+    ($_ptr:expr, $_type:ty, $_member:ident) => {{
+        unsafe {
+            container_of!(bindings::rust_read_once($_ptr), $_type, $_member)
+        }
+    }};
 }
 
 /// yama_ptracer_del written in Rust
@@ -70,12 +74,15 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 
     let mut marked = false;
 
-    unsafe {
-        bindings::rcu_read_lock();
+    let guard = Guard::new();
 
-        list_for_each_entry_rcu(
+    unsafe {
+        list_for_each_entry_rcu!(
+            pos,
             bindings::rust_ptracer_relations(),
-            |relation| {
+            bindings::ptrace_relation,
+            node,
+            {
                 pr_info!(
                     "tracer pid = {}\n",
                     bindings::rust_task_pid_nr(tracer)
@@ -85,27 +92,30 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
                     bindings::rust_task_pid_nr(tracee)
                 );
 
-                if (*relation).invalid {
-                    return;
+                if (*pos).invalid {
+                    continue;
                 }
 
-                if (*relation).tracee == tracee
-                    || (!tracer.is_null() && (*relation).tracer == tracer)
+                if (*pos).tracee == tracee
+                    || (!tracer.is_null() && (*pos).tracer == tracer)
                 {
-                    (*relation).invalid = true;
+                    (*pos).invalid = true;
                     marked = true;
                 }
-            },
+            }
         );
+    }
 
-        bindings::rcu_read_unlock();
+    guard.unlock();
 
+    unsafe {
         if marked {
             bindings::rust_schedule_work(
                 bindings::rust_yama_relation_work(),
             );
         }
     }
+
 }
 
 /// yama_ptrace_traceme written in Rust

@@ -18,7 +18,7 @@ struct ptrace_relation {
 	struct rcu_head rcu;
 };
 
-struct list_head *rust_read_once_list_next(struct list_head *node);
+struct list_head *rust_read_once(struct list_head *ptr);
 bool rust_read_once_bool(bool *p);
 struct task_struct *rust_read_once_task(struct task_struct **p);
 struct list_head *rust_ptracer_relations(void);

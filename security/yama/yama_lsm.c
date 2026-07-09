@@ -38,9 +38,9 @@ struct access_report_info {
 };
 
 // Defined in the yama header
-struct list_head *rust_read_once_list_next(struct list_head *node)
+struct list_head *rust_read_once(struct list_head *ptr)
 {
-    return READ_ONCE(node->next);
+    return READ_ONCE(ptr);
 }
 
 bool rust_read_once_bool(bool *p)
@@ -233,7 +233,7 @@ static void yama_ptracer_del(struct task_struct *tracer,
 
 	if (marked)
 		schedule_work(&yama_relation_work);
-	 */
+	*/
 }
 
 /**
