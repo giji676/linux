@@ -43,6 +43,10 @@ struct access_report_info {
 };
 
 // Defined in the yama header
+struct list_head *rust_read_once_list_next(const struct list_head *node)
+{
+	return READ_ONCE(node->next);
+}
 struct list_head *rust_read_once(struct list_head *ptr)
 {
     return READ_ONCE(ptr);
