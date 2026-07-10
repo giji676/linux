@@ -31,63 +31,6 @@ static DEFINE_SPINLOCK(ptracer_relations_lock);
 static void yama_relation_cleanup(struct work_struct *work);
 static DECLARE_WORK(yama_relation_work, yama_relation_cleanup);
 
-struct access_report_info {
-	struct callback_head work;
-	const char *access;
-	struct task_struct *target;
-	struct task_struct *agent;
-};
-
-// Defined in the yama header
-struct list_head *rust_read_once_list_next(const struct list_head *node)
-{
-	return READ_ONCE(node->next);
-}
-struct list_head *rust_read_once(struct list_head *ptr)
-{
-	return READ_ONCE(ptr);
-}
-
-bool rust_read_once_bool(bool *p)
-{
-	return READ_ONCE(*p);
-}
-
-struct task_struct *rust_read_once_task(struct task_struct **p)
-{
-	return READ_ONCE(*p);
-}
-
-struct list_head *rust_ptracer_relations(void)
-{
-	return &ptracer_relations;
-}
-
-struct work_struct *rust_yama_relation_work(void)
-{
-	return &yama_relation_work;
-}
-
-void rust_schedule_work(struct work_struct *work)
-{
-	schedule_work(work);
-}
-
-int rust_task_pid_nr(struct task_struct *task)
-{
-	return task_pid_nr(task);
-}
-
-const struct cred *rust_task_cred(struct task_struct *task)
-{
-	return __task_cred(task);
-}
-
-struct user_namespace *rust_current_user_ns(void)
-{
-	return current_user_ns();
-}
-
 static void __report_access(struct callback_head *work)
 {
 	struct access_report_info *info =

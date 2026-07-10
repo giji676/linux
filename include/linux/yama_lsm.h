@@ -3,6 +3,7 @@
 
 #include "linux/types.h"
 #include <linux/list.h>
+#include <linux/spinlock.h>
 
 #define YAMA_SCOPE_DISABLED	0
 #define YAMA_SCOPE_RELATIONAL	1
@@ -18,6 +19,13 @@ struct ptrace_relation {
 	struct rcu_head rcu;
 };
 
+struct access_report_info {
+	struct callback_head work;
+	const char *access;
+	struct task_struct *target;
+	struct task_struct *agent;
+};
+
 struct list_head *rust_read_once_list_next(const struct list_head *node);
 struct list_head *rust_read_once(struct list_head *ptr);
 bool rust_read_once_bool(bool *p);
@@ -28,5 +36,11 @@ void rust_schedule_work(struct work_struct *work);
 int rust_task_pid_nr(struct task_struct *task);
 const struct cred *rust_task_cred(struct task_struct *task);
 struct user_namespace *rust_current_user_ns(void);
+
+struct access_report_info *rust_kmalloc_access_report_info(void);
+void rust_assert_spin_locked(spinlock_t *lock);
+void rust_report_access_ratelimited(const char *access,
+				     const char *target_comm, int target_pid,
+				     const char *agent_comm, int agent_pid);
 
 #endif
