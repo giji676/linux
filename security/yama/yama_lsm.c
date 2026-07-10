@@ -227,28 +227,7 @@ extern int rust_yama_ptracer_del(struct task_struct *tracer,
 static void yama_ptracer_del(struct task_struct *tracer,
 			     struct task_struct *tracee)
 {
-	pr_info("YAMA: yama_ptracer_del\n");
 	rust_yama_ptracer_del(tracer, tracee);
-
-	/*
-	struct ptrace_relation *relation;
-	bool marked = false;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(relation, &ptracer_relations, node) {
-		if (relation->invalid)
-			continue;
-		if (relation->tracee == tracee ||
-		    (tracer && relation->tracer == tracer)) {
-			relation->invalid = true;
-			marked = true;
-		}
-	}
-	rcu_read_unlock();
-
-	if (marked)
-		schedule_work(&yama_relation_work);
-	*/
 }
 
 /**
@@ -452,7 +431,6 @@ extern int rust_yama_ptrace_traceme(struct task_struct *parent, int scope);
  */
 static int yama_ptrace_traceme(struct task_struct *parent)
 {
-	pr_info("YAMA: yama_prace_traceme tracer parent pid: %d\n", parent->pid);
 	int rc = 0;
 	rc = rust_yama_ptrace_traceme(parent, ptrace_scope);
 

@@ -72,29 +72,28 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
     tracer: *mut bindings::task_struct,
     tracee: *mut bindings::task_struct,
 ) {
-    pr_info!("rust_yama_ptracer_del\n");
+    // pr_info!("rust_yama_ptracer_del\n");
 
     let mut marked = false;
 
     let guard = Guard::new();
     let relations = unsafe { bindings::rust_ptracer_relations() };
-    unsafe {
-        list_for_each_entry_rcu!(
-            pos,
-            relations,
-            bindings::ptrace_relation,
-            node,
-            {
-                if (*pos).invalid {
-                    continue;
-                }
 
-                if (*pos).tracee == tracee
-                    || (!tracer.is_null() && (*pos).tracer == tracer)
-                {
-                    (*pos).invalid = true;
-                    marked = true;
-                }
+    list_for_each_entry_rcu!(
+        pos,
+        relations,
+        bindings::ptrace_relation,
+        node,
+        {
+            if (*pos).invalid {
+                continue;
+            }
+
+            if (*pos).tracee == tracee
+                || (!tracer.is_null() && (*pos).tracer == tracer)
+            {
+                (*pos).invalid = true;
+                marked = true;
             }
         }
     );
@@ -110,17 +109,6 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
     }
 }
 
-// bool has_ns_capability(struct task_struct *t,
-// 		       struct user_namespace *ns, int cap)
-// {
-// 	int ret;
-//
-// 	rcu_read_lock();
-// 	ret = security_capable(__task_cred(t), ns, cap, CAP_OPT_NONE);
-// 	rcu_read_unlock();
-//
-// 	return (ret == 0);
-// }
 fn has_ns_capability(
     t: *mut bindings::task_struct,
     ns: *mut bindings::user_namespace,
@@ -146,8 +134,6 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
     parent: *mut bindings::task_struct,
     ptrace_scope: ffi::c_int
 ) -> ffi::c_int {
-    pr_info!("rust_yama_ptrace_traceme\n");
-
     match ptrace_scope {
         val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
             unsafe {
