@@ -45,17 +45,17 @@ struct list_head *rust_read_once_list_next(const struct list_head *node)
 }
 struct list_head *rust_read_once(struct list_head *ptr)
 {
-    return READ_ONCE(ptr);
+	return READ_ONCE(ptr);
 }
 
 bool rust_read_once_bool(bool *p)
 {
-    return READ_ONCE(*p);
+	return READ_ONCE(*p);
 }
 
 struct task_struct *rust_read_once_task(struct task_struct **p)
 {
-    return READ_ONCE(*p);
+	return READ_ONCE(*p);
 }
 
 struct list_head *rust_ptracer_relations(void)
@@ -70,22 +70,22 @@ struct work_struct *rust_yama_relation_work(void)
 
 void rust_schedule_work(struct work_struct *work)
 {
-    schedule_work(work);
+	schedule_work(work);
 }
 
 int rust_task_pid_nr(struct task_struct *task)
 {
-    return task_pid_nr(task);
+	return task_pid_nr(task);
 }
 
 const struct cred *rust_task_cred(struct task_struct *task)
 {
-    return __task_cred(task);
+	return __task_cred(task);
 }
 
 struct user_namespace *rust_current_user_ns(void)
 {
-    return current_user_ns();
+	return current_user_ns();
 }
 
 static void __report_access(struct callback_head *work)
