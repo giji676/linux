@@ -1,6 +1,8 @@
 use kernel::prelude::*;
 use kernel::bindings;
 use core::ffi;
+use core::ptr::addr_of;
+use core::mem::offset_of;
 use kernel::sync::rcu::Guard;
 
 // LOG_PREFIX for pr_info! macro
@@ -13,17 +15,19 @@ const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
 macro_rules! list_for_each_entry_rcu {
     ($pos:ident, $head:expr, $container:ty, $member:ident, $body:block) => {{
         unsafe {
-            let mut $pos =
+            let mut __cursor: *mut $container =
                 list_entry_rcu!((*$head).next, $container, $member);
-
-            while core::ptr::addr_of!((*$pos).$member) != $head {
-                $body
-
-                $pos = list_entry_rcu!(
+            loop {
+                if addr_of!((*__cursor).$member) == $head {
+                    break;
+                }
+                let $pos = __cursor;
+                __cursor = list_entry_rcu!(
                     (*$pos).$member.next,
                     $container,
                     $member
                 );
+                $body
             }
         }
     }};
@@ -40,14 +44,14 @@ macro_rules! container_of {
         // Checks if a field is a member of the given container
         // if it isn't compiler will complain
         let __field_ptr =
-            core::ptr::addr_of!(
+            addr_of!(
                 (*core::ptr::NonNull::<$container>::dangling().as_ptr()).$field
             );
 
         assert_same_type(__ptr as *const _, __field_ptr);
 
         (__ptr as *const u8)
-            .sub(core::mem::offset_of!($container, $field))
+            .sub(offset_of!($container, $field))
             as *mut $container
     }};
 }
@@ -55,7 +59,10 @@ macro_rules! container_of {
 #[macro_export]
 macro_rules! list_entry_rcu {
     ($_ptr:expr, $_type:ty, $_member:ident) => {{
-        container_of!(bindings::rust_read_once($_ptr), $_type, $_member)
+        container_of!(
+            bindings::rust_read_once($_ptr),
+            $_type,
+            $_member)
     }};
 }
 
@@ -70,31 +77,24 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
     let mut marked = false;
 
     let guard = Guard::new();
-
-    list_for_each_entry_rcu!(
-        pos,
-        bindings::rust_ptracer_relations(),
-        bindings::ptrace_relation,
-        node,
-        {
-            pr_info!(
-                "tracer pid = {}\n",
-                bindings::rust_task_pid_nr(tracer)
-            );
-            pr_info!(
-                "tracee pid = {}\n",
-                bindings::rust_task_pid_nr(tracee)
-            );
-
-            if (*pos).invalid {
-                continue;
-            }
-
-            if (*pos).tracee == tracee
-                || (!tracer.is_null() && (*pos).tracer == tracer)
+    let relations = unsafe { bindings::rust_ptracer_relations() };
+    unsafe {
+        list_for_each_entry_rcu!(
+            pos,
+            relations,
+            bindings::ptrace_relation,
+            node,
             {
-                (*pos).invalid = true;
-                marked = true;
+                if (*pos).invalid {
+                    continue;
+                }
+
+                if (*pos).tracee == tracee
+                    || (!tracer.is_null() && (*pos).tracer == tracer)
+                {
+                    (*pos).invalid = true;
+                    marked = true;
+                }
             }
         }
     );
@@ -108,7 +108,6 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
             );
         }
     }
-
 }
 
 // bool has_ns_capability(struct task_struct *t,
