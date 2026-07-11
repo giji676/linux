@@ -21,8 +21,6 @@
 #include <linux/spinlock.h>
 #include <uapi/linux/lsm.h>
 
-// static int ptrace_scope = YAMA_SCOPE_RELATIONAL;
-// static int ptrace_scope = YAMA_SCOPE_NO_ATTACH;
 static int ptrace_scope = YAMA_SCOPE_CAPABILITY;
 
 static LIST_HEAD(ptracer_relations);
@@ -31,62 +29,14 @@ static DEFINE_SPINLOCK(ptracer_relations_lock);
 static void yama_relation_cleanup(struct work_struct *work);
 static DECLARE_WORK(yama_relation_work, yama_relation_cleanup);
 
-static void __report_access(struct callback_head *work)
-{
-	struct access_report_info *info =
-		container_of(work, struct access_report_info, work);
-	char *target_cmd, *agent_cmd;
-
-	target_cmd = kstrdup_quotable_cmdline(info->target, GFP_KERNEL);
-	agent_cmd = kstrdup_quotable_cmdline(info->agent, GFP_KERNEL);
-
-	pr_notice_ratelimited(
-		"ptrace %s of \"%s\"[%d] was attempted by \"%s\"[%d]\n",
-		info->access, target_cmd, info->target->pid, agent_cmd,
-		info->agent->pid);
-
-	kfree(agent_cmd);
-	kfree(target_cmd);
-
-	put_task_struct(info->agent);
-	put_task_struct(info->target);
-	kfree(info);
-}
+extern void rust_report_access(const char *access, struct task_struct *target,
+				struct task_struct *agent);
 
 /* defers execution because cmdline access can sleep */
 static void report_access(const char *access, struct task_struct *target,
 				struct task_struct *agent)
 {
-	struct access_report_info *info;
-
-	assert_spin_locked(&target->alloc_lock); /* for target->comm */
-
-	if (current->flags & PF_KTHREAD) {
-		/* I don't think kthreads call task_work_run() before exiting.
-		 * Imagine angry ranting about procfs here.
-		 */
-		pr_notice_ratelimited(
-		    "ptrace %s of \"%s\"[%d] was attempted by \"%s\"[%d]\n",
-		    access, target->comm, target->pid, agent->comm, agent->pid);
-		return;
-	}
-
-	info = kmalloc_obj(*info, GFP_ATOMIC);
-	if (!info)
-		return;
-	init_task_work(&info->work, __report_access);
-	get_task_struct(target);
-	get_task_struct(agent);
-	info->access = access;
-	info->target = target;
-	info->agent = agent;
-	if (task_work_add(current, &info->work, TWA_RESUME) == 0)
-		return; /* success */
-
-	WARN(1, "report_access called from exiting task");
-	put_task_struct(target);
-	put_task_struct(agent);
-	kfree(info);
+	rust_report_access(access, target, agent);
 }
 
 /**
@@ -123,11 +73,6 @@ static void yama_relation_cleanup(struct work_struct *work)
 static int yama_ptracer_add(struct task_struct *tracer,
 			    struct task_struct *tracee)
 {
-	pr_info("YAMA: ptracer_add ");
-	if (tracer)
-		pr_info("tracer=%d tracee=%d", tracer->pid, tracee->pid);
-	else
-		pr_info("tracer=ANY tracee=%d", tracee->pid);
 	struct ptrace_relation *relation, *added;
 
 	added = kmalloc_obj(*added);
@@ -179,7 +124,6 @@ static void yama_ptracer_del(struct task_struct *tracer,
  */
 static void yama_task_free(struct task_struct *task)
 {
-	// pr_info("yama_task_free\n");
 	yama_ptracer_del(task, task);
 }
 
@@ -197,7 +141,6 @@ static void yama_task_free(struct task_struct *task)
 static int yama_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 			   unsigned long arg4, unsigned long arg5)
 {
-	// pr_info("yama_task_prctl\n");
 	int rc = -ENOSYS;
 	struct task_struct *myself;
 
@@ -326,7 +269,6 @@ unlock:
 static int yama_ptrace_access_check(struct task_struct *child,
 				    unsigned int mode)
 {
-	// pr_info("yama_ptrace_access_check\n");
 	int rc = 0;
 
 	/* require ptrace target be a child of ptracer on attach */
@@ -374,16 +316,7 @@ extern int rust_yama_ptrace_traceme(struct task_struct *parent, int scope);
  */
 static int yama_ptrace_traceme(struct task_struct *parent)
 {
-	int rc = 0;
-	rc = rust_yama_ptrace_traceme(parent, ptrace_scope);
-
-	if (rc) {
-		task_lock(current);
-		report_access("traceme", current, parent);
-		task_unlock(current);
-	}
-
-	return rc;
+	return rust_yama_ptrace_traceme(parent, ptrace_scope);
 }
 
 static const struct lsm_id yama_lsmid = {

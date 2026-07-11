@@ -69,3 +69,35 @@ void rust_report_access_ratelimited(const char *access,
 	    "ptrace %s of \"%s\"[%d] was attempted by \"%s\"[%d]\n",
 	    access, target_comm, target_pid, agent_comm, agent_pid);
 }
+
+void rust_task_lock(struct task_struct *task)
+{
+	spin_lock(&task->alloc_lock);
+}
+
+void rust_task_unlock(struct task_struct *task)
+{
+	spin_unlock(&task->alloc_lock);
+}
+
+void __report_access(struct callback_head *work)
+{
+	struct access_report_info *info =
+		container_of(work, struct access_report_info, work);
+	char *target_cmd, *agent_cmd;
+
+	target_cmd = kstrdup_quotable_cmdline(info->target, GFP_KERNEL);
+	agent_cmd = kstrdup_quotable_cmdline(info->agent, GFP_KERNEL);
+
+	pr_notice_ratelimited(
+		"ptrace %s of \"%s\"[%d] was attempted by \"%s\"[%d]\n",
+		info->access, target_cmd, info->target->pid, agent_cmd,
+		info->agent->pid);
+
+	kfree(agent_cmd);
+	kfree(target_cmd);
+
+	put_task_struct(info->agent);
+	put_task_struct(info->target);
+	kfree(info);
+}

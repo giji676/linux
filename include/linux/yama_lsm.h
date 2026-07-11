@@ -36,8 +36,10 @@ void rust_schedule_work(struct work_struct *work);
 int rust_task_pid_nr(struct task_struct *task);
 const struct cred *rust_task_cred(struct task_struct *task);
 struct user_namespace *rust_current_user_ns(void);
-
+void rust_task_lock(struct task_struct *task);
+void rust_task_unlock(struct task_struct *task);
 struct access_report_info *rust_kmalloc_access_report_info(void);
+void __report_access(struct callback_head *work);
 void rust_assert_spin_locked(spinlock_t *lock);
 void rust_report_access_ratelimited(const char *access,
 				     const char *target_comm, int target_pid,

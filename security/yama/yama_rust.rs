@@ -1,7 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! Rust port of the Yama LSM's ptrace-scope enforcement logic.
+//!
+//! C source: [`security/yama/yama_lsm.c`](srctree/security/yama/yama_lsm.c).
+
 use kernel::prelude::*;
 use kernel::bindings;
 use core::ffi;
 use core::ptr::addr_of;
+use core::ptr::addr_of_mut;
 use core::mem::offset_of;
 use kernel::sync::rcu::Guard;
 
@@ -106,9 +113,7 @@ macro_rules! container_of {
 macro_rules! list_entry_rcu {
     ($_ptr:expr, $_type:ty, $_member:ident) => {{
         container_of!(
-            // SAFETY: caller guarantees `$_ptr` is valid for a `READ_ONCE`
-            // read of a `list_head *`, per this macro's documented requirements.
-            unsafe { bindings::rust_read_once($_ptr) },
+            bindings::rust_read_once($_ptr),
             $_type,
             $_member)
     }};
@@ -215,6 +220,8 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
     parent: *mut bindings::task_struct,
     ptrace_scope: ffi::c_int
 ) -> ffi::c_int {
+    let mut rc: ffi::c_int = 0;
+
     match ptrace_scope {
         val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
             // SAFETY: `parent` is valid per this function's own safety
@@ -227,15 +234,179 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
                     bindings::rust_current_user_ns(),
                     bindings::CAP_SYS_PTRACE as ffi::c_int,
                 ) {
-                    return -(bindings::EPERM as c_int);
+                    rc = -(bindings::EPERM as ffi::c_int);
                 }
             }
         }
         val if val == bindings::YAMA_SCOPE_NO_ATTACH as ffi::c_int => {
-            return -(bindings::EPERM as c_int);
+            rc = -(bindings::EPERM as ffi::c_int);
         }
-        _ => {
-        }
+        _ => {}
     }
-    0
+
+    if rc != 0 {
+        let current = current!();
+
+        // SAFETY: `current.as_ptr()` is the currently running task, valid for
+        // the duration of this scope.
+        let _guard = unsafe { TaskLockGuard::new(current.as_ptr()) };
+
+        // SAFETY: `c"traceme"` is `'static`. `current.as_ptr()` is valid and
+        // its `alloc_lock` is held via `_guard` for the duration of this call,
+        // satisfying `rust_report_access`'s locking requirement. `parent` is
+        // valid per this function's own safety contract.
+        unsafe {
+            rust_report_access(
+                c"traceme".as_ptr().cast::<u8>(),
+                current.as_ptr(),
+                parent,
+            )
+        };
+        // alloc_lock released here via `_guard`'s Drop
+    }
+
+    rc
+}
+
+/// report_access written in Rust.
+///
+/// # Safety
+///
+/// - `access` must be a valid, nul-terminated C string pointer with
+///   `'static` storage duration. It may be stored inside a heap-allocated
+///   `access_report_info` and read later, after this function returns, from
+///   the deferred `__report_access` task_work callback - so it must outlive
+///   this call, not just be valid during it.
+/// - `target` and `agent` must be valid, non-null `task_struct` pointers
+///   that remain valid for the duration of this call.
+/// - The caller must hold `target->alloc_lock` for the duration of this
+///   call (matches the C original's `assert_spin_locked(&target->alloc_lock)`
+///   comment: "for target->comm").
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_report_access(
+    access: *const u8,
+    target: *mut bindings::task_struct,
+    agent: *mut bindings::task_struct,
+) {
+    // SAFETY: `target` is valid and its `alloc_lock` is held by the caller,
+    // per this function's own safety contract.
+    unsafe {
+        bindings::rust_assert_spin_locked(addr_of_mut!((*target).alloc_lock));
+    }
+
+    let current = current!();
+    let current_ptr = current.as_ptr();
+
+    // SAFETY: `current_ptr` is the currently running task, always valid.
+    // `flags` is a plain field read with no aliasing concerns.
+    let flags = unsafe { (*current_ptr).flags };
+
+    if flags & bindings::PF_KTHREAD != 0 {
+        // SAFETY: `access` is valid and `'static` per this function's
+        // safety contract. `target` and `agent` are valid per this
+        // function's safety contract, so `target->comm`/`agent->comm` are
+        // valid nul-terminated buffers to read, and `rust_task_pid_nr` is
+        // safe to call on both.
+        unsafe {
+            bindings::rust_report_access_ratelimited(
+                access,
+                addr_of!((*target).comm).cast(),
+                bindings::rust_task_pid_nr(target),
+                addr_of!((*agent).comm).cast(),
+                bindings::rust_task_pid_nr(agent),
+            );
+        }
+        return;
+    }
+
+    // SAFETY: `rust_kmalloc_access_report_info` has no preconditions; it
+    // may return null on allocation failure, which is checked immediately
+    // below before the pointer is dereferenced.
+    let info: *mut bindings::access_report_info = unsafe {
+        bindings::rust_kmalloc_access_report_info()
+    };
+
+    if info.is_null() {
+        return;
+    }
+
+    // SAFETY: `info` was just allocated above and confirmed non-null, so
+    // it's valid to write its fields. `bindings::__report_access` is a
+    // valid, non-null function pointer with the signature `task_work_add`
+    // expects. `target` and `agent` are valid per this function's safety
+    // contract, and `get_task_struct` is safe to call on any valid,
+    // non-null task pointer - this takes the reference that `agent`/
+    // `target` will be held under until the deferred callback (or the
+    // failure-path cleanup below) releases it.
+    unsafe {
+        (*info).work.func = Some(bindings::__report_access);
+        (*info).access = access;
+        (*info).target = target;
+        (*info).agent = agent;
+
+        bindings::get_task_struct(target);
+        bindings::get_task_struct(agent);
+    }
+
+    // SAFETY: `current_ptr` is the currently running task. `info->work` was
+    // just initialized above via the write to `.func`, and `info` remains
+    // valid (not yet freed) at this point.
+    let ret = unsafe {
+        bindings::task_work_add(
+            current_ptr,
+            addr_of_mut!((*info).work),
+            bindings::task_work_notify_mode_TWA_RESUME
+        )
+    };
+
+    if ret == 0 {
+        return;
+    }
+
+    kernel::pr_warn!("report_access called from exiting task\n");
+
+    // SAFETY: `task_work_add` failed, so `info->work` was never enqueued
+    // and nothing else holds a reference to `info`, `target`, or `agent`
+    // beyond what was taken above - undoing exactly those: the two
+    // `get_task_struct` calls and the `rust_kmalloc_access_report_info`
+    // allocation, all performed earlier in this same call.
+    unsafe {
+        bindings::put_task_struct(target);
+        bindings::put_task_struct(agent);
+        bindings::kfree(info.cast());
+    }
+}
+
+/// RAII guard around `task_lock()`/`task_unlock()` (i.e. `spin_lock`/
+/// `spin_unlock` on `task_struct::alloc_lock`).
+///
+/// Holding this guard is equivalent to having called `task_lock(task)`;
+/// dropping it calls `task_unlock(task)`.
+struct TaskLockGuard {
+    task: *mut bindings::task_struct,
+}
+
+impl TaskLockGuard {
+    /// Acquires `task->alloc_lock`.
+    ///
+    /// # Safety
+    ///
+    /// `task` must be a valid, non-null `task_struct` pointer that remains
+    /// valid for the entire lifetime of the returned guard.
+    unsafe fn new(task: *mut bindings::task_struct) -> Self {
+        // SAFETY: caller guarantees `task` is valid, per this function's
+        // own safety contract. `rust_task_lock` is safe to call on any
+        // valid, non-null task pointer.
+        unsafe { bindings::rust_task_lock(task) };
+        Self { task }
+    }
+}
+
+impl Drop for TaskLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.task->alloc_lock` was locked in `new()` and the
+        // task pointer is guaranteed valid for the guard's whole lifetime,
+        // per `new()`'s safety contract.
+        unsafe { bindings::rust_task_unlock(self.task) };
+    }
 }
