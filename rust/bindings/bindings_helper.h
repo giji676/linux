@@ -69,6 +69,7 @@
 #include <linux/jump_label.h>
 #include <linux/lsm_hooks.h> // MYEDIT
 #include <linux/yama_lsm.h> // MYEDIT
+#include <linux/ptrace.h> // MYEDIT
 #include <linux/mdio.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>

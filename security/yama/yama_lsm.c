@@ -21,7 +21,7 @@
 #include <linux/spinlock.h>
 #include <uapi/linux/lsm.h>
 
-static int ptrace_scope = YAMA_SCOPE_CAPABILITY;
+static int ptrace_scope = YAMA_SCOPE_DISABLED;
 
 static LIST_HEAD(ptracer_relations);
 static DEFINE_SPINLOCK(ptracer_relations_lock);
@@ -259,6 +259,9 @@ unlock:
 	return rc;
 }
 
+extern int rust_yama_ptrace_access_check(struct task_struct *child,
+				    unsigned int mode, int scope);
+
 /**
  * yama_ptrace_access_check - validate PTRACE_ATTACH calls
  * @child: task that current task is attempting to ptrace
@@ -270,6 +273,8 @@ static int yama_ptrace_access_check(struct task_struct *child,
 				    unsigned int mode)
 {
 	int rc = 0;
+
+	return rust_yama_ptrace_access_check(child, mode, ptrace_scope);
 
 	/* require ptrace target be a child of ptracer on attach */
 	if (mode & PTRACE_MODE_ATTACH) {

@@ -80,6 +80,11 @@ void rust_task_unlock(struct task_struct *task)
 	spin_unlock(&task->alloc_lock);
 }
 
+struct task_struct *rust_rcu_dereference_task(struct task_struct *p)
+{
+    return rcu_dereference(p);
+}
+
 void __report_access(struct callback_head *work)
 {
 	struct access_report_info *info =

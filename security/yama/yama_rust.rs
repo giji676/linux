@@ -10,7 +10,7 @@ use core::ffi;
 use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
 use core::mem::offset_of;
-use kernel::sync::rcu::Guard;
+use kernel::sync::rcu::read_lock;
 
 // LOG_PREFIX for pr_info! macro
 const __LOG_PREFIX: &[u8] = b"YAMA_RUST\0";
@@ -100,6 +100,7 @@ macro_rules! container_of {
             as *mut $container
     }};
 }
+
 ///
 /// # Safety requirements
 ///
@@ -135,7 +136,8 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 ) {
     let mut marked = false;
 
-    let guard = Guard::new();
+    // let guard = Guard::new();
+    let guard = read_lock();
 
     // SAFETY: `relations` points at the static `ptracer_relations` list head,
     // which is always initialized for the lifetime of the module.
@@ -189,7 +191,8 @@ unsafe fn has_ns_capability(
     cap: ffi::c_int,
 ) -> bool {
     let ret: ffi::c_int;
-    let guard = Guard::new();
+    // let guard = Guard::new();
+    let guard = read_lock();
 
     // SAFETY: `t` and `ns` are valid per this function's own safety
     // contract. `rust_task_cred(t)` returns a `cred` pointer that's only
@@ -409,4 +412,187 @@ impl Drop for TaskLockGuard {
         // per `new()`'s safety contract.
         unsafe { bindings::rust_task_unlock(self.task) };
     }
+}
+
+/// pid_alive written in Rust.
+///
+/// # Safety
+///
+/// `p` must be a valid, non-null `task_struct` pointer, valid for the
+/// duration of this call.
+unsafe fn pid_alive(p: *const bindings::task_struct) -> bool {
+    // SAFETY: caller guarantees `p` is valid, per this function's own
+    // safety contract. `thread_pid` is a plain field read.
+    unsafe { !(*p).thread_pid.is_null() }
+}
+
+unsafe fn thread_group_leader(
+    p: *const bindings::task_struct
+) -> bool {
+    unsafe { (*p).exit_signal >= 0 }
+}
+
+unsafe fn task_is_descendant(
+    mut parent: *mut bindings::task_struct,
+    child: *mut bindings::task_struct
+) -> bool {
+    let mut walker = child;
+
+    if parent.is_null() || child.is_null() {
+        return false;
+    }
+
+    let _guard = read_lock();
+
+    unsafe {
+        if !thread_group_leader(parent) {
+            parent = bindings::rust_rcu_dereference_task((*parent).group_leader);
+        }
+    }
+
+    unsafe {
+        while (*walker).pid > 0 {
+            if !thread_group_leader(walker) {
+                walker = bindings::rust_rcu_dereference_task((*walker).group_leader);
+            }
+            if walker == parent {
+                return true;
+            }
+            walker = bindings::rust_rcu_dereference_task((*walker).real_parent);
+        }
+    }
+
+    false
+}
+
+unsafe fn same_thread_group(
+    p1: *const bindings::task_struct,
+    p2: *const bindings::task_struct
+) -> bool {
+    unsafe { (*p1).signal == (*p2).signal }
+}
+
+unsafe fn ptrace_parent(
+    task: *const bindings::task_struct
+) -> *mut bindings::task_struct {
+    unsafe {
+        // NOTE: `unlikly` branch prediction hint is omitted from the original C code
+        if (*task).ptrace != 0 {
+            bindings::rust_rcu_dereference_task((*task).parent)
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn ptracer_exception_found(
+    tracer: *mut bindings::task_struct,
+    mut tracee: *mut bindings::task_struct,
+) -> bool {
+    let _guard = read_lock();
+
+	let mut parent = unsafe { ptrace_parent(tracee) };
+
+	if !parent.is_null() &&
+        unsafe { same_thread_group(parent, tracer) } {
+        return true;
+	}
+
+    unsafe {
+        if !thread_group_leader(tracee) {
+            tracee = bindings::rust_rcu_dereference_task((*tracee).group_leader);
+        }
+    }
+
+    let relations = unsafe { bindings::rust_ptracer_relations() };
+
+    list_for_each_entry_rcu!(
+        pos,
+        relations,
+        bindings::ptrace_relation,
+        node,
+    {
+        if (*pos).invalid {
+            continue;
+        }
+
+        if (*pos).tracee == tracee {
+            parent = (*pos).tracer;
+            break;
+        }
+    }
+    );
+
+    if  parent.is_null() || unsafe { task_is_descendant(parent, tracer) } {
+        true
+    } else {
+        false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_yama_ptrace_access_check(
+    child: *mut bindings::task_struct,
+    mode: ffi::c_uint,
+    ptrace_scope: ffi::c_int
+) -> ffi::c_int {
+    let mut rc: ffi::c_int = 0;
+
+    let current = current!();
+    let current_ptr = current.as_ptr();
+
+    if mode & bindings::PTRACE_MODE_ATTACH != 0 {
+        match ptrace_scope {
+            val if val == bindings::YAMA_SCOPE_DISABLED as ffi::c_int => {
+            }
+            val if val == bindings::YAMA_SCOPE_RELATIONAL as ffi::c_int => {
+                let _guard = read_lock();
+                unsafe {
+                    if !pid_alive(child) {
+                        rc = -(bindings::EPERM as ffi::c_int);
+                    }
+
+                    if rc == 0 && !task_is_descendant(current_ptr, child) &&
+                        !ptracer_exception_found(current_ptr, child) &&
+                        !bindings::ns_capable(
+                            (*bindings::rust_task_cred(child)).user_ns,
+                            bindings::CAP_SYS_PTRACE as i32) {
+
+                        rc = -(bindings::EPERM as ffi::c_int);
+                    }
+                }
+            }
+            val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
+                let _guard = read_lock();
+                unsafe {
+                    if !bindings::ns_capable(
+                        (*bindings::rust_task_cred(child)).user_ns,
+                        bindings::CAP_SYS_PTRACE as i32) {
+                        rc = -(bindings::EPERM as ffi::c_int);
+                    }
+                }
+            }
+            val if val == bindings::YAMA_SCOPE_NO_ATTACH as ffi::c_int => {
+                rc = -(bindings::EPERM as ffi::c_int);
+            }
+            _ => {
+                rc = -(bindings::EPERM as ffi::c_int);
+            }
+        }
+    }
+
+    if rc != 0 && (mode & bindings::PTRACE_MODE_NOAUDIT) == 0 {
+        // SAFETY: `child` valid per this function's contract, `_guard`
+        // holds `child->alloc_lock` for the duration of this call.
+        let _guard = unsafe { TaskLockGuard::new(child) };
+        unsafe {
+            rust_report_access(
+                c"attach".as_ptr().cast::<u8>(),
+                child,
+                current_ptr
+            );
+        }
+    }
+
+	rc
 }

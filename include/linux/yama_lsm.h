@@ -44,5 +44,6 @@ void rust_assert_spin_locked(spinlock_t *lock);
 void rust_report_access_ratelimited(const char *access,
 				     const char *target_comm, int target_pid,
 				     const char *agent_comm, int agent_pid);
+struct task_struct *rust_rcu_dereference_task(struct task_struct *p);
 
 #endif
