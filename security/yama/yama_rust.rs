@@ -412,7 +412,7 @@ unsafe fn task_is_descendant(
     // function's contract; RCU held via `_guard`.
     unsafe {
         if !thread_group_leader(parent) {
-            parent = bindings::rust_rcu_dereference_task((*parent).group_leader);
+            parent = bindings::rust_rcu_dereference_task(addr_of!((*parent).group_leader));
         }
     }
 
@@ -422,12 +422,12 @@ unsafe fn task_is_descendant(
     unsafe {
         while (*walker).pid > 0 {
             if !thread_group_leader(walker) {
-                walker = bindings::rust_rcu_dereference_task((*walker).group_leader);
+                walker = bindings::rust_rcu_dereference_task(addr_of!((*walker).group_leader));
             }
             if walker == parent {
                 return true;
             }
-            walker = bindings::rust_rcu_dereference_task((*walker).real_parent);
+            walker = bindings::rust_rcu_dereference_task(addr_of!((*walker).real_parent));
         }
     }
 
@@ -461,7 +461,7 @@ unsafe fn ptrace_parent(
     // SAFETY: `task` valid and RCU held, per this function's contract.
     unsafe {
         if (*task).ptrace != 0 {
-            bindings::rust_rcu_dereference_task((*task).parent)
+            bindings::rust_rcu_dereference_task(addr_of!((*task).parent))
         } else {
             core::ptr::null_mut()
         }
@@ -474,7 +474,7 @@ unsafe fn ptrace_parent(
 ///
 /// `tracer` and `tracee` must be valid `task_struct` pointers, valid for
 /// the call.
-unsafe extern "C" fn ptracer_exception_found(
+unsafe fn ptracer_exception_found(
     tracer: *mut bindings::task_struct,
     mut tracee: *mut bindings::task_struct,
 ) -> bool {
@@ -493,7 +493,7 @@ unsafe extern "C" fn ptracer_exception_found(
     // SAFETY: `tracee` valid per this function's contract; RCU held via `_guard`.
     unsafe {
         if !thread_group_leader(tracee) {
-            tracee = bindings::rust_rcu_dereference_task((*tracee).group_leader);
+            tracee = bindings::rust_rcu_dereference_task(addr_of!((*tracee).group_leader));
         }
     }
 
