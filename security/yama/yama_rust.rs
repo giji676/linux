@@ -66,14 +66,9 @@ fn assert_same_type<T>(_: *const T, _: *const T) {}
 
 /// # Safety requirements
 ///
-/// - `$ptr` must be a valid, non-null pointer to the `$field` member of some
-///   live `$container` value (i.e. it must actually point *inside* such a
-///   struct at the right offset, not just be any valid pointer of the same
-///   type).
-/// - Must be invoked from an `unsafe` context - the pointer arithmetic
-///   (`.sub()`) inside is itself unsafe and is not independently wrapped
-///   here, so callers get no compiler enforcement beyond what surrounds the
-///   macro invocation.
+/// `$ptr` must point at the `$field` member of a live `$container`. Must
+/// be invoked from an unsafe context (the `.sub()` below is not itself
+/// wrapped).
 #[macro_export]
 macro_rules! container_of {
     ($ptr:expr, $container:ty, $field:ident) => {{
@@ -101,15 +96,10 @@ macro_rules! container_of {
     }};
 }
 
-///
 /// # Safety requirements
 ///
-/// - `$_ptr` must be a valid pointer to read via `READ_ONCE` (i.e. valid for
-///   reads of a pointer-sized value at this point in time - the RCU-critical-
-///   section requirement for what it *points to* is the caller's
-///   responsibility, not this macro's).
-/// - The value read from `$_ptr` must satisfy `container_of!`'s requirements
-///   above (point at the `$_member` field of a live `$_type`).
+/// `$_ptr` must be valid for a `READ_ONCE` read of a pointer; the value
+/// read must satisfy `container_of!`'s requirements.
 #[macro_export]
 macro_rules! list_entry_rcu {
     ($_ptr:expr, $_type:ty, $_member:ident) => {{
@@ -124,11 +114,8 @@ macro_rules! list_entry_rcu {
 ///
 /// # Safety
 ///
-/// - `tracer` must be either null or a valid, non-dangling `task_struct` pointer.
-/// - `tracee` must be a valid, non-dangling `task_struct` pointer.
-/// - Both pointers must remain valid for the duration of this call (guaranteed
-///   by the C caller holding an appropriate reference/lock, same as the
-///   original C `yama_ptracer_del`).
+/// `tracer` must be null or a valid `task_struct` pointer; `tracee` must
+/// be a valid `task_struct` pointer. Both must remain valid for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_yama_ptracer_del(
     tracer: *mut bindings::task_struct,
@@ -136,16 +123,13 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 ) {
     let mut marked = false;
 
-    // let guard = Guard::new();
     let guard = read_lock();
 
-    // SAFETY: `relations` points at the static `ptracer_relations` list head,
-    // which is always initialized for the lifetime of the module.
+    // SAFETY: `ptracer_relations` is a static, always-initialized list head.
     let relations = unsafe { bindings::rust_ptracer_relations() };
 
-    // SAFETY: we're inside an RCU read-side critical section (see `Guard::new()`
-    // below), and `relations` is a valid, permanently-live list head, satisfying
-    // the traversal macro's requirements.
+    // SAFETY: RCU held via `guard`; `relations` is a valid, permanently
+    // live list head.
     list_for_each_entry_rcu!(
         pos,
         relations,
@@ -167,6 +151,8 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 
     guard.unlock();
 
+    // SAFETY: `rust_yama_relation_work()` returns the static work item,
+    // always valid to schedule.
     unsafe {
         if marked {
             bindings::rust_schedule_work(
@@ -180,26 +166,20 @@ pub unsafe extern "C" fn rust_yama_ptracer_del(
 ///
 /// # Safety
 ///
-/// - `t` must be a valid, non-null `task_struct` pointer, valid for the
-///   duration of this call (its `cred` is read via RCU-protected access
-///   internally by `rust_task_cred`).
-/// - `ns` must be a valid, non-null `user_namespace` pointer, valid for the
-///   duration of this call.
+/// `t` must be a valid `task_struct` pointer; `ns` must be a valid
+/// `user_namespace` pointer. Both valid for the duration of this call.
 unsafe fn has_ns_capability(
     t: *mut bindings::task_struct,
     ns: *mut bindings::user_namespace,
     cap: ffi::c_int,
 ) -> bool {
     let ret: ffi::c_int;
-    // let guard = Guard::new();
-    let guard = read_lock();
 
-    // SAFETY: `t` and `ns` are valid per this function's own safety
-    // contract. `rust_task_cred(t)` returns a `cred` pointer that's only
-    // valid for the duration of the current RCU read-side critical section
-    // (held here via `guard`), which `security_capable()` is called within
-    // before the guard is dropped - satisfying `__task_cred()`'s usual
-    // requirement of being read under `rcu_read_lock()`.
+    let _guard = read_lock();
+
+    // SAFETY: `t` and `ns` valid per this function's contract; `rust_task_cred`
+    // is read under the RCU section held by `_guard`, satisfying
+    // `__task_cred()`'s requirement.
     unsafe {
         ret = bindings::security_capable(
             bindings::rust_task_cred(t),
@@ -208,7 +188,6 @@ unsafe fn has_ns_capability(
             bindings::CAP_OPT_NONE,
         );
     }
-    guard.unlock();
     ret == 0
 }
 
@@ -227,10 +206,8 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
 
     match ptrace_scope {
         val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
-            // SAFETY: `parent` is valid per this function's own safety
-            // contract. `rust_current_user_ns()` always returns a valid,
-            // non-null `user_namespace` for the currently running task, so
-            // both of `has_ns_capability`'s pointer requirements are met.
+            // SAFETY: `parent` valid per this function's contract;
+            // `rust_current_user_ns()` always returns a valid pointer.
             unsafe {
                 if !has_ns_capability(
                     parent,
@@ -255,9 +232,8 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
         let _guard = unsafe { TaskLockGuard::new(current.as_ptr()) };
 
         // SAFETY: `c"traceme"` is `'static`. `current.as_ptr()` is valid and
-        // its `alloc_lock` is held via `_guard` for the duration of this call,
-        // satisfying `rust_report_access`'s locking requirement. `parent` is
-        // valid per this function's own safety contract.
+        // its `alloc_lock` is held via `_guard`; `parent` is
+        // valid per this function's safety contract.
         unsafe {
             rust_report_access(
                 c"traceme".as_ptr().cast::<u8>(),
@@ -265,7 +241,6 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
                 parent,
             )
         };
-        // alloc_lock released here via `_guard`'s Drop
     }
 
     rc
@@ -275,24 +250,18 @@ pub unsafe extern "C" fn rust_yama_ptrace_traceme(
 ///
 /// # Safety
 ///
-/// - `access` must be a valid, nul-terminated C string pointer with
-///   `'static` storage duration. It may be stored inside a heap-allocated
-///   `access_report_info` and read later, after this function returns, from
-///   the deferred `__report_access` task_work callback - so it must outlive
-///   this call, not just be valid during it.
-/// - `target` and `agent` must be valid, non-null `task_struct` pointers
-///   that remain valid for the duration of this call.
-/// - The caller must hold `target->alloc_lock` for the duration of this
-///   call (matches the C original's `assert_spin_locked(&target->alloc_lock)`
-///   comment: "for target->comm").
+/// - `access` must be `'static` (may be read later by the 
+///   `__report_access` task_work callback).
+/// - `target`/`agent` must be valid `task_struct` pointers, valid for the
+///   call.
+/// - Caller must hold `target->alloc_lock` (for `target->comm`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_report_access(
     access: *const u8,
     target: *mut bindings::task_struct,
     agent: *mut bindings::task_struct,
 ) {
-    // SAFETY: `target` is valid and its `alloc_lock` is held by the caller,
-    // per this function's own safety contract.
+    // SAFETY: `target->alloc_lock` held by caller, per this function's contract.
     unsafe {
         bindings::rust_assert_spin_locked(addr_of_mut!((*target).alloc_lock));
     }
@@ -301,15 +270,10 @@ pub unsafe extern "C" fn rust_report_access(
     let current_ptr = current.as_ptr();
 
     // SAFETY: `current_ptr` is the currently running task, always valid.
-    // `flags` is a plain field read with no aliasing concerns.
     let flags = unsafe { (*current_ptr).flags };
 
     if flags & bindings::PF_KTHREAD != 0 {
-        // SAFETY: `access` is valid and `'static` per this function's
-        // safety contract. `target` and `agent` are valid per this
-        // function's safety contract, so `target->comm`/`agent->comm` are
-        // valid nul-terminated buffers to read, and `rust_task_pid_nr` is
-        // safe to call on both.
+        // SAFETY: `access`/`target`/`agent` valid per this function's contract.
         unsafe {
             bindings::rust_report_access_ratelimited(
                 access,
@@ -322,9 +286,7 @@ pub unsafe extern "C" fn rust_report_access(
         return;
     }
 
-    // SAFETY: `rust_kmalloc_access_report_info` has no preconditions; it
-    // may return null on allocation failure, which is checked immediately
-    // below before the pointer is dereferenced.
+    // SAFETY: null return (alloc failure) is checked before any deref.
     let info: *mut bindings::access_report_info = unsafe {
         bindings::rust_kmalloc_access_report_info()
     };
@@ -333,14 +295,10 @@ pub unsafe extern "C" fn rust_report_access(
         return;
     }
 
-    // SAFETY: `info` was just allocated above and confirmed non-null, so
-    // it's valid to write its fields. `bindings::__report_access` is a
-    // valid, non-null function pointer with the signature `task_work_add`
-    // expects. `target` and `agent` are valid per this function's safety
-    // contract, and `get_task_struct` is safe to call on any valid,
-    // non-null task pointer - this takes the reference that `agent`/
-    // `target` will be held under until the deferred callback (or the
-    // failure-path cleanup below) releases it.
+    // SAFETY: `info` newly allocated and non-null; `target`/`agent`
+    // valid per this function's contract; `get_task_struct` takes the
+    // refs that the deferred callback (or the failure path below) will
+    // release.
     unsafe {
         (*info).work.func = Some(bindings::__report_access);
         (*info).access = access;
@@ -351,9 +309,7 @@ pub unsafe extern "C" fn rust_report_access(
         bindings::get_task_struct(agent);
     }
 
-    // SAFETY: `current_ptr` is the currently running task. `info->work` was
-    // just initialized above via the write to `.func`, and `info` remains
-    // valid (not yet freed) at this point.
+    // SAFETY: `current_ptr` is the running task; `info->work` initialized above.
     let ret = unsafe {
         bindings::task_work_add(
             current_ptr,
@@ -368,11 +324,8 @@ pub unsafe extern "C" fn rust_report_access(
 
     kernel::pr_warn!("report_access called from exiting task\n");
 
-    // SAFETY: `task_work_add` failed, so `info->work` was never enqueued
-    // and nothing else holds a reference to `info`, `target`, or `agent`
-    // beyond what was taken above - undoing exactly those: the two
-    // `get_task_struct` calls and the `rust_kmalloc_access_report_info`
-    // allocation, all performed earlier in this same call.
+    // SAFETY: `task_work_add` failed, so nothing else holds these refs;
+    // undoing the `get_task_struct`/alloc done above.
     unsafe {
         bindings::put_task_struct(target);
         bindings::put_task_struct(agent);
@@ -409,7 +362,6 @@ impl Drop for TaskLockGuard {
     fn drop(&mut self) {
         // SAFETY: `self.task->alloc_lock` was locked in `new()` and the
         // task pointer is guaranteed valid for the guard's whole lifetime,
-        // per `new()`'s safety contract.
         unsafe { bindings::rust_task_unlock(self.task) };
     }
 }
@@ -426,12 +378,24 @@ unsafe fn pid_alive(p: *const bindings::task_struct) -> bool {
     unsafe { !(*p).thread_pid.is_null() }
 }
 
+/// thread_group_leader written in Rust.
+///
+/// # Safety
+///
+/// `p` must be a valid `task_struct` pointer, valid for the call.
 unsafe fn thread_group_leader(
     p: *const bindings::task_struct
 ) -> bool {
+    // SAFETY: caller guarantees `p` valid; plain field read.
     unsafe { (*p).exit_signal >= 0 }
 }
 
+/// task_is_descendant written in Rust.
+///
+/// # Safety
+///
+/// `parent` and `child`, if non-null, must be valid `task_struct`
+/// pointers, valid for the call.
 unsafe fn task_is_descendant(
     mut parent: *mut bindings::task_struct,
     child: *mut bindings::task_struct
@@ -444,12 +408,17 @@ unsafe fn task_is_descendant(
 
     let _guard = read_lock();
 
+    // SAFETY: `parent` non-null (checked above), valid per this
+    // function's contract; RCU held via `_guard`.
     unsafe {
         if !thread_group_leader(parent) {
             parent = bindings::rust_rcu_dereference_task((*parent).group_leader);
         }
     }
 
+    // SAFETY: `walker` starts as `child` (non-null, checked above) and is
+    // only ever reassigned to RCU-read pointers below, read while
+    // `_guard` is held.
     unsafe {
         while (*walker).pid > 0 {
             if !thread_group_leader(walker) {
@@ -465,18 +434,32 @@ unsafe fn task_is_descendant(
     false
 }
 
+/// same_thread_group written in Rust.
+///
+/// # Safety
+///
+/// `p1` and `p2` must be valid `task_struct` pointers, valid for the call.
 unsafe fn same_thread_group(
     p1: *const bindings::task_struct,
     p2: *const bindings::task_struct
 ) -> bool {
+    // SAFETY: caller guarantees both pointers valid; plain field reads.
     unsafe { (*p1).signal == (*p2).signal }
 }
 
+/// ptrace_parent written in Rust.
+///
+/// # Safety
+///
+/// `task` must be a valid `task_struct` pointer. Caller must hold the RCU
+/// read lock; the returned pointer is only valid for that critical
+/// section.
 unsafe fn ptrace_parent(
     task: *const bindings::task_struct
 ) -> *mut bindings::task_struct {
+    // NOTE: `unlikely` branch prediction hint omitted from the original C code.
+    // SAFETY: `task` valid and RCU held, per this function's contract.
     unsafe {
-        // NOTE: `unlikly` branch prediction hint is omitted from the original C code
         if (*task).ptrace != 0 {
             bindings::rust_rcu_dereference_task((*task).parent)
         } else {
@@ -485,44 +468,60 @@ unsafe fn ptrace_parent(
     }
 }
 
+/// ptracer_exception_found written in Rust.
+///
+/// # Safety
+///
+/// `tracer` and `tracee` must be valid `task_struct` pointers, valid for
+/// the call.
 unsafe extern "C" fn ptracer_exception_found(
     tracer: *mut bindings::task_struct,
     mut tracee: *mut bindings::task_struct,
 ) -> bool {
     let _guard = read_lock();
 
+    // SAFETY: `tracee` valid per this function's contract; RCU held via `_guard`.
 	let mut parent = unsafe { ptrace_parent(tracee) };
 
 	if !parent.is_null() &&
+        // SAFETY: `parent` just checked to be non-null; `tracer` valid per
+        // this function's contract.
         unsafe { same_thread_group(parent, tracer) } {
         return true;
 	}
 
+    // SAFETY: `tracee` valid per this function's contract; RCU held via `_guard`.
     unsafe {
         if !thread_group_leader(tracee) {
             tracee = bindings::rust_rcu_dereference_task((*tracee).group_leader);
         }
     }
 
+    // SAFETY: `ptracer_relations` is a static, always-initialized list head.
     let relations = unsafe { bindings::rust_ptracer_relations() };
 
+    // SAFETY: RCU held via `_guard`; `relations` is a valid, permanently
+    // live list head.
     list_for_each_entry_rcu!(
         pos,
         relations,
         bindings::ptrace_relation,
         node,
-    {
-        if (*pos).invalid {
-            continue;
-        }
+        {
+            if (*pos).invalid {
+                continue;
+            }
 
-        if (*pos).tracee == tracee {
-            parent = (*pos).tracer;
-            break;
+            if (*pos).tracee == tracee {
+                parent = (*pos).tracer;
+                break;
+            }
         }
-    }
     );
 
+    // SAFETY: `parent` is either null or was read from a live relation
+    // above (or from `ptrace_parent`); `tracer` valid per this function's
+    // contract.
     if  parent.is_null() || unsafe { task_is_descendant(parent, tracer) } {
         true
     } else {
@@ -530,6 +529,11 @@ unsafe extern "C" fn ptracer_exception_found(
     }
 }
 
+/// yama_ptrace_access_check written in Rust.
+///
+/// # Safety
+///
+/// `child` must be a valid `task_struct` pointer, valid for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_yama_ptrace_access_check(
     child: *mut bindings::task_struct,
@@ -547,6 +551,9 @@ pub unsafe extern "C" fn rust_yama_ptrace_access_check(
             }
             val if val == bindings::YAMA_SCOPE_RELATIONAL as ffi::c_int => {
                 let _guard = read_lock();
+                // SAFETY: `child` valid per this function's contract; RCU
+                // held via `_guard` for the whole block; `current_ptr` is
+                // the running task, always valid.
                 unsafe {
                     if !pid_alive(child) {
                         rc = -(bindings::EPERM as ffi::c_int);
@@ -564,6 +571,8 @@ pub unsafe extern "C" fn rust_yama_ptrace_access_check(
             }
             val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
                 let _guard = read_lock();
+                // SAFETY: `child` valid per this function's contract; RCU
+                // held via `_guard`.
                 unsafe {
                     if !bindings::ns_capable(
                         (*bindings::rust_task_cred(child)).user_ns,
