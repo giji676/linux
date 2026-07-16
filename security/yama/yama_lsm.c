@@ -29,6 +29,8 @@ static DEFINE_SPINLOCK(ptracer_relations_lock);
 static void yama_relation_cleanup(struct work_struct *work);
 static DECLARE_WORK(yama_relation_work, yama_relation_cleanup);
 
+#define RUST
+
 extern void rust_report_access(const char *access, struct task_struct *target,
 				struct task_struct *agent);
 
@@ -36,7 +38,41 @@ extern void rust_report_access(const char *access, struct task_struct *target,
 static void report_access(const char *access, struct task_struct *target,
 				struct task_struct *agent)
 {
+#ifdef RUST
 	rust_report_access(access, target, agent);
+	return;
+#endif
+
+	struct access_report_info *info;
+
+	assert_spin_locked(&target->alloc_lock); /* for target->comm */
+
+	if (current->flags & PF_KTHREAD) {
+		/* I don't think kthreads call task_work_run() before exiting.
+		 * Imagine angry ranting about procfs here.
+		 */
+		pr_notice_ratelimited(
+		    "ptrace %s of \"%s\"[%d] was attempted by \"%s\"[%d]\n",
+		    access, target->comm, target->pid, agent->comm, agent->pid);
+		return;
+	}
+
+	info = kmalloc_obj(*info, GFP_ATOMIC);
+	if (!info)
+		return;
+	init_task_work(&info->work, __report_access);
+	get_task_struct(target);
+	get_task_struct(agent);
+	info->access = access;
+	info->target = target;
+	info->agent = agent;
+	if (task_work_add(current, &info->work, TWA_RESUME) == 0)
+		return; /* success */
+
+	WARN(1, "report_access called from exiting task");
+	put_task_struct(target);
+	put_task_struct(agent);
+	kfree(info);
 }
 
 /**
@@ -115,7 +151,27 @@ extern int rust_yama_ptracer_del(struct task_struct *tracer,
 static void yama_ptracer_del(struct task_struct *tracer,
 			     struct task_struct *tracee)
 {
+#ifdef RUST	
 	rust_yama_ptracer_del(tracer, tracee);
+	return;
+#endif
+	struct ptrace_relation *relation;
+	bool marked = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(relation, &ptracer_relations, node) {
+		if (relation->invalid)
+			continue;
+		if (relation->tracee == tracee ||
+		    (tracer && relation->tracer == tracer)) {
+			relation->invalid = true;
+			marked = true;
+		}
+	}
+	rcu_read_unlock();
+
+	if (marked)
+		schedule_work(&yama_relation_work);
 }
 
 /**
@@ -272,9 +328,11 @@ extern int rust_yama_ptrace_access_check(struct task_struct *child,
 static int yama_ptrace_access_check(struct task_struct *child,
 				    unsigned int mode)
 {
-	int rc = 0;
-
+#ifdef RUST
 	return rust_yama_ptrace_access_check(child, mode, ptrace_scope);
+#endif
+
+	int rc = 0;
 
 	/* require ptrace target be a child of ptracer on attach */
 	if (mode & PTRACE_MODE_ATTACH) {
@@ -321,7 +379,30 @@ extern int rust_yama_ptrace_traceme(struct task_struct *parent, int scope);
  */
 static int yama_ptrace_traceme(struct task_struct *parent)
 {
+#ifdef RUST
 	return rust_yama_ptrace_traceme(parent, ptrace_scope);
+#endif
+
+	int rc = 0;
+
+	/* Only disallow PTRACE_TRACEME on more aggressive settings. */
+	switch (ptrace_scope) {
+	case YAMA_SCOPE_CAPABILITY:
+		if (!has_ns_capability(parent, current_user_ns(), CAP_SYS_PTRACE))
+			rc = -EPERM;
+		break;
+	case YAMA_SCOPE_NO_ATTACH:
+		rc = -EPERM;
+		break;
+	}
+
+	if (rc) {
+		task_lock(current);
+		report_access("traceme", current, parent);
+		task_unlock(current);
+	}
+
+	return rc;
 }
 
 static const struct lsm_id yama_lsmid = {
